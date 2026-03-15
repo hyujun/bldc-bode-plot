@@ -8,5 +8,9 @@ __pycache__/
 *.npz
 *.png
 
+# Claude
+.claude/
+CLAUDE.md
+
 # OS
 .DS_Store
