@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Measurement outputs
+*.npz
+*.png
+
+# OS
+.DS_Store
