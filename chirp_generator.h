@@ -3,9 +3,10 @@
  * @brief   Header-only excitation signal generators for BLDC current
  *          controller bandwidth measurement.
  *
- * Provides two signal types:
+ * Provides three signal types:
  *   1. Logarithmic chirp  — continuous frequency sweep
  *   2. Schroeder multisine — sum of cosines at log-spaced frequencies
+ *   3. Step signal — 0 → amplitude step for time-domain analysis
  *
  * Target:  STM32H723 (Cortex-M7, single-precision FPU)
  *
@@ -287,6 +288,139 @@ static inline float multisine_elapsed(const multisine_state_t *state)
  * @brief  Get progress [0.0, 1.0].
  */
 static inline float multisine_progress(const multisine_state_t *state)
+{
+    return (float)state->sample / (float)state->total;
+}
+
+
+/* ════════════════════════════════════════════════════════════
+ * Step signal generator
+ *
+ *   Phase 1 (pre-step)  : output = dc_bias        for t < settle_time
+ *   Phase 2 (step)      : output = amplitude       for settle_time ≤ t < settle_time + hold_time
+ *   Phase 3 (post-step) : output = dc_bias         (done)
+ *
+ * The pre-step settle phase lets the current controller reach
+ * steady-state at dc_bias before the step is applied.
+ * ════════════════════════════════════════════════════════════ */
+
+#ifndef STEP_SETTLE_TIME
+#define STEP_SETTLE_TIME      0.5f    /* [s]  pre-step settle duration */
+#endif
+
+#ifndef STEP_HOLD_TIME
+#define STEP_HOLD_TIME        0.2f    /* [s]  step hold duration       */
+#endif
+
+#ifndef STEP_N_REPEATS
+#define STEP_N_REPEATS        5       /* number of step repetitions    */
+#endif
+
+typedef struct {
+    float    amplitude;         /* Step target [A]                     */
+    float    dc_bias;           /* Pre-step baseline [A]               */
+    float    settle_time;       /* Pre-step settle [s]                 */
+    float    hold_time;         /* Step hold [s]                       */
+    uint32_t n_repeats;         /* Number of step cycles               */
+
+    /* Derived */
+    uint32_t settle_samples;    /* Samples per settle phase            */
+    uint32_t hold_samples;      /* Samples per hold phase              */
+    uint32_t cycle_samples;     /* settle + hold per one cycle         */
+    uint32_t total;             /* Total samples (all cycles)          */
+
+    /* Runtime */
+    uint32_t sample;            /* Current sample index                */
+    bool     done;
+} step_state_t;
+
+/**
+ * @brief  Initialize the step generator.
+ * @param  state  Pointer to step state struct
+ */
+static inline void step_init(step_state_t *state)
+{
+    state->amplitude      = CHIRP_AMPLITUDE;
+    state->dc_bias        = CHIRP_DC_BIAS;
+    state->settle_time    = STEP_SETTLE_TIME;
+    state->hold_time      = STEP_HOLD_TIME;
+    state->n_repeats      = STEP_N_REPEATS;
+
+    state->settle_samples = (uint32_t)(STEP_SETTLE_TIME * CHIRP_FS);
+    state->hold_samples   = (uint32_t)(STEP_HOLD_TIME * CHIRP_FS);
+    state->cycle_samples  = state->settle_samples + state->hold_samples;
+    state->total          = state->cycle_samples * STEP_N_REPEATS;
+
+    state->sample = 0;
+    state->done   = false;
+}
+
+/**
+ * @brief  Generate the next step sample. Call at fs rate.
+ * @param  state  Pointer to initialized step state
+ * @return Target current [A].
+ *
+ * Output pattern per cycle:
+ *   [0, settle_samples)           → dc_bias   (baseline)
+ *   [settle_samples, cycle_end)   → amplitude (step)
+ */
+static inline float step_next(step_state_t *state)
+{
+    if (state->done) {
+        return state->dc_bias;
+    }
+
+    /* Position within current cycle */
+    uint32_t pos_in_cycle = state->sample % state->cycle_samples;
+    float value;
+
+    if (pos_in_cycle < state->settle_samples) {
+        value = state->dc_bias;        /* settle / baseline */
+    } else {
+        value = state->amplitude;      /* step active       */
+    }
+
+    /* Safety clamp */
+    if (value > CHIRP_MAX_CURRENT)  value = CHIRP_MAX_CURRENT;
+    if (value < -CHIRP_MAX_CURRENT) value = -CHIRP_MAX_CURRENT;
+
+    state->sample++;
+    if (state->sample >= state->total) {
+        state->done = true;
+    }
+
+    return value;
+}
+
+/**
+ * @brief  Check if all step cycles have finished.
+ */
+static inline bool step_is_done(const step_state_t *state)
+{
+    return state->done;
+}
+
+/**
+ * @brief  Reset the step generator.
+ */
+static inline void step_reset(step_state_t *state)
+{
+    state->sample = 0;
+    state->done   = false;
+}
+
+/**
+ * @brief  Get elapsed time [s].
+ */
+static inline float step_elapsed(const step_state_t *state)
+{
+    return (float)state->sample * CHIRP_DT;
+}
+
+/**
+ * @brief  Get progress [0.0, 1.0].
+ */
+static inline float step_progress(const step_state_t *state)
 {
     return (float)state->sample / (float)state->total;
 }

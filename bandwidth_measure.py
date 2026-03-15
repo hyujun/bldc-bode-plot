@@ -54,6 +54,11 @@ class MeasurementConfig:
     amplitude: float       = 0.3      # [A]   15 % of nominal
     dc_bias: float         = 0.0      # [A]
 
+    # Step test
+    step_settle: float     = 0.5      # [s]  pre-step settle
+    step_hold: float       = 0.2      # [s]  step hold duration
+    step_repeats: int      = 5        # number of step cycles
+
     # FRF
     nperseg: int   = 2048
     noverlap: int  = 1024
@@ -251,6 +256,47 @@ class MultisineGenerator:
 
 
 # ════════════════════════════════════════════════════════════
+# Step generator  (0 → amplitude step, repeated N times)
+# ════════════════════════════════════════════════════════════
+class StepGenerator:
+    """
+    Generates repeated step signals for direct time-domain analysis.
+
+    Each cycle:
+      [0, settle_time)   → dc_bias    (baseline)
+      [settle_time, end) → amplitude  (step)
+
+    Repeated step_repeats times → ensemble average for noise reduction.
+    """
+
+    def __init__(self, cfg: MeasurementConfig):
+        self.cfg = cfg
+        cycle_len = cfg.step_settle + cfg.step_hold
+        total_dur = cycle_len * cfg.step_repeats
+        self.t_arr = np.arange(0, total_dur, 1.0 / cfg.fs)
+        self.i_ref_arr = self._generate()
+
+    def _generate(self) -> np.ndarray:
+        c = self.cfg
+        cycle_samples  = int((c.step_settle + c.step_hold) * c.fs)
+        settle_samples = int(c.step_settle * c.fs)
+
+        x = np.full(len(self.t_arr), c.dc_bias)
+        for i in range(c.step_repeats):
+            start = i * cycle_samples + settle_samples
+            end   = (i + 1) * cycle_samples
+            if end <= len(x):
+                x[start:end] = c.amplitude
+            else:
+                x[start:len(x)] = c.amplitude
+
+        return np.clip(x, -c.max_current, c.max_current)
+
+    def get_full_reference(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.t_arr.copy(), self.i_ref_arr.copy()
+
+
+# ════════════════════════════════════════════════════════════
 # FRF estimator
 # ════════════════════════════════════════════════════════════
 class FRFEstimator:
@@ -417,6 +463,251 @@ def _step_metrics(t: np.ndarray, s: np.ndarray) -> dict:
         m["t_settle"] = float(t[outside[-1]])
 
     return m
+
+
+# ════════════════════════════════════════════════════════════
+# Step response analysis  (direct time-domain measurement)
+# ════════════════════════════════════════════════════════════
+def _analyze_step_response(
+    t: np.ndarray,
+    i_ref: np.ndarray,
+    i_meas: np.ndarray,
+    cfg: MeasurementConfig,
+) -> dict:
+    """
+    Extract individual step responses from repeated step signal,
+    ensemble-average them, and compute metrics.
+
+    Returns
+    ───────
+    dict with keys:
+        t_step     — time array for one step cycle [s]
+        responses  — list of individual normalized responses
+        avg        — ensemble-averaged normalized response
+        metrics    — dict with t_rise, overshoot_pct, t_settle, ss_error
+    """
+    cycle_samples  = int((cfg.step_settle + cfg.step_hold) * cfg.fs)
+    settle_samples = int(cfg.step_settle * cfg.fs)
+    hold_samples   = int(cfg.step_hold * cfg.fs)
+
+    # Extract individual step responses (from step edge onward)
+    responses = []
+    for i in range(cfg.step_repeats):
+        start = i * cycle_samples + settle_samples
+        end   = start + hold_samples
+        if end > len(i_meas):
+            break
+
+        # Baseline: mean of last 20% of settle phase
+        base_start = i * cycle_samples + int(settle_samples * 0.8)
+        base_end   = i * cycle_samples + settle_samples
+        baseline   = float(np.mean(i_meas[base_start:base_end]))
+
+        resp = i_meas[start:end]
+        target = cfg.amplitude - baseline
+
+        # Normalize: 0 = baseline, 1 = target
+        if abs(target) > 1e-9:
+            resp_norm = (resp - baseline) / target
+        else:
+            resp_norm = resp - baseline
+
+        responses.append(resp_norm)
+
+    if not responses:
+        raise ValueError("No valid step responses found")
+
+    # Ensemble average
+    min_len = min(len(r) for r in responses)
+    responses = [r[:min_len] for r in responses]
+    avg = np.mean(responses, axis=0)
+
+    t_step = np.arange(min_len) / cfg.fs
+
+    # Metrics from averaged response
+    metrics = _step_metrics(t_step, avg)
+
+    # Steady-state error (last 20%)
+    ss_val = float(np.mean(avg[int(0.8 * len(avg)):]))
+    metrics["ss_error_pct"] = abs(1.0 - ss_val) * 100.0
+
+    return dict(
+        t_step=t_step,
+        responses=responses,
+        avg=avg,
+        metrics=metrics,
+    )
+
+
+def plot_step_results(
+    t: np.ndarray,
+    i_ref: np.ndarray,
+    i_meas: np.ndarray,
+    step_data: dict,
+    cfg: MeasurementConfig,
+    save_path: str = "step_response_result.png",
+) -> None:
+    """
+    Two-panel step response figure
+    ───────────────────────────────
+    Top    : Raw time-domain data (i_ref + i_meas)
+    Bottom : Ensemble-averaged normalized step response with metrics
+    """
+    _apply_style()
+
+    t_step   = step_data["t_step"]
+    avg      = step_data["avg"]
+    resps    = step_data["responses"]
+    metrics  = step_data["metrics"]
+    t_ms     = t_step * 1e3
+
+    # ── Figure ──────────────────────────────────────────────
+    fig = plt.figure(figsize=(14, 9), dpi=140)
+    fig.patch.set_facecolor(_BG)
+
+    # Suptitle
+    parts = []
+    if metrics["t_rise"] is not None:
+        parts.append(f"t_rise = {metrics['t_rise']*1e3:.2f} ms")
+    if metrics["overshoot_pct"] is not None:
+        parts.append(f"OS = {metrics['overshoot_pct']:.1f} %")
+    if metrics["t_settle"] is not None:
+        parts.append(f"t_settle = {metrics['t_settle']*1e3:.2f} ms")
+    if metrics.get("ss_error_pct") is not None:
+        parts.append(f"SS err = {metrics['ss_error_pct']:.2f} %")
+
+    fig.suptitle(
+        "BLDC Current Controller   ·   Step Response (measured)   ·   "
+        + "   |   ".join(parts),
+        color=_TXT, fontsize=10.5, fontweight="bold",
+        y=0.985, x=0.5,
+    )
+
+    gs = gridspec.GridSpec(
+        2, 1, figure=fig,
+        height_ratios=[0.8, 1.2],
+        hspace=0.38,
+        left=0.07, right=0.97, top=0.94, bottom=0.08,
+    )
+
+    # ════════════════════════════════════════════════════════
+    # [0]  Raw time-domain data
+    # ════════════════════════════════════════════════════════
+    ax_raw = fig.add_subplot(gs[0])
+    _style_ax(ax_raw)
+
+    t_plot = t * 1e3  # ms
+    ax_raw.plot(t_plot, i_ref,  color=_BLUE, lw=1.2, alpha=0.8,
+                label="i_ref (target)")
+    ax_raw.plot(t_plot, i_meas, color=_GREEN, lw=1.0, alpha=0.7,
+                label="i_meas (measured)")
+
+    ax_raw.set_xlabel("Time [ms]")
+    ax_raw.set_ylabel("Current [A]")
+    ax_raw.set_title(
+        f"Raw Data   ({cfg.step_repeats} cycles × "
+        f"{cfg.step_settle}s settle + {cfg.step_hold}s hold)"
+    )
+    ax_raw.legend(loc="upper right", handlelength=1.6)
+
+    # ════════════════════════════════════════════════════════
+    # [1]  Ensemble-averaged step response
+    # ════════════════════════════════════════════════════════
+    ax_step = fig.add_subplot(gs[1])
+    _style_ax(ax_step)
+
+    # Individual responses (dim)
+    for i, r in enumerate(resps):
+        t_r = np.arange(len(r)) / cfg.fs * 1e3
+        ax_step.plot(t_r, r, color=_DIMTXT, lw=0.6, alpha=0.4,
+                     label="individual" if i == 0 else None)
+
+    # Averaged response
+    ax_step.plot(t_ms, avg, color=_GREEN, lw=2.2, zorder=4,
+                 label=f"ensemble avg (N={len(resps)})")
+
+    # Guides
+    ax_step.axhline(1.00, color=_DIMTXT, lw=0.8, ls=":", zorder=1)
+    ax_step.fill_between(t_ms, 0.98, 1.02, color=_DIMTXT,
+                         alpha=0.08, zorder=1)
+    ax_step.plot(t_ms, np.full_like(t_ms, 0.98),
+                 color=_DIMTXT, lw=0.5, ls="--", zorder=1, alpha=0.5)
+    ax_step.plot(t_ms, np.full_like(t_ms, 1.02),
+                 color=_DIMTXT, lw=0.5, ls="--", zorder=1, alpha=0.5,
+                 label="±2 % band")
+    ax_step.axhline(0.0, color=_SPINE, lw=0.6, zorder=1)
+
+    # ── Rise time bracket ─────────────────────────────────────
+    if metrics["t_rise"] is not None:
+        ss_val = float(np.mean(avg[int(0.80 * len(avg)):]))
+        i_lo   = int(np.argmax(avg >= 0.10 * ss_val))
+        i_hi   = int(np.argmax(avg >= 0.90 * ss_val))
+        tr_ms  = metrics["t_rise"] * 1e3
+
+        ax_step.axvline(t_ms[i_lo], color=_CYAN, lw=0.8, ls=":", alpha=0.7)
+        ax_step.axvline(t_ms[i_hi], color=_CYAN, lw=0.8, ls=":", alpha=0.7)
+        ax_step.scatter([t_ms[i_lo], t_ms[i_hi]],
+                        [avg[i_lo], avg[i_hi]],
+                        color=_CYAN, s=22, zorder=5)
+
+        mid_t = (t_ms[i_lo] + t_ms[i_hi]) / 2.0
+        y_arr = (avg[i_lo] + avg[i_hi]) / 2.0
+        ax_step.annotate(
+            "", xy=(t_ms[i_hi], y_arr),
+            xytext=(t_ms[i_lo], y_arr),
+            arrowprops=dict(arrowstyle="<->", color=_CYAN, lw=1.2),
+            zorder=5,
+        )
+        ax_step.text(
+            mid_t, y_arr + 0.055,
+            f"t_rise = {tr_ms:.2f} ms",
+            color=_CYAN, fontsize=8.5, ha="center", va="bottom",
+            fontweight="bold", zorder=5,
+        )
+
+    # ── Settling time ──────────────────────────────────────────
+    if metrics["t_settle"] is not None:
+        ts_ms = metrics["t_settle"] * 1e3
+        ax_step.axvline(ts_ms, color=_PURPLE, lw=1.3, ls="--", zorder=2,
+                        label=f"t_settle = {ts_ms:.2f} ms")
+        ax_step.text(
+            ts_ms + (t_ms[-1] - t_ms[0]) * 0.007, 0.08,
+            f"t_settle\n{ts_ms:.2f} ms",
+            color=_PURPLE, fontsize=7.5, va="bottom",
+        )
+
+    # ── Overshoot ──────────────────────────────────────────────
+    if metrics["overshoot_pct"] is not None and metrics["overshoot_pct"] > 0.3:
+        pk_idx = int(np.argmax(avg))
+        os_pct = metrics["overshoot_pct"]
+        ax_step.scatter([t_ms[pk_idx]], [avg[pk_idx]],
+                        color=_YELLOW, s=30, zorder=6)
+        ax_step.annotate(
+            f"OS = {os_pct:.1f} %",
+            xy=(t_ms[pk_idx], avg[pk_idx]),
+            xytext=(t_ms[pk_idx] + (t_ms[-1] - t_ms[0]) * 0.03,
+                    avg[pk_idx] + 0.04),
+            color=_YELLOW, fontsize=8.5, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=_YELLOW, lw=0.9),
+            zorder=5,
+        )
+
+    # Axis config
+    y_lo_s = min(float(avg.min()) - 0.08, -0.12)
+    y_hi_s = max(float(avg.max()) + 0.12, 1.25)
+    ax_step.set_xlim([0.0, t_ms[-1]])
+    ax_step.set_ylim([y_lo_s, y_hi_s])
+    ax_step.set_xlabel("Time [ms]")
+    ax_step.set_ylabel("Normalized amplitude")
+    ax_step.set_title(
+        "Step Response   (direct measurement, ensemble averaged)"
+    )
+    ax_step.legend(loc="lower right", handlelength=1.6, ncol=2)
+
+    # ── Save ──────────────────────────────────────────────────
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+    logger.info(f"Step response plot saved → {save_path}")
+    plt.show()
 
 
 # ════════════════════════════════════════════════════════════
@@ -928,9 +1219,40 @@ def _run_demo(signal_type: str = "chirp") -> None:
         H(s) = ωn² / (s² + 2ζωn·s + ωn²)
     with ωn = 2π·180 rad/s, ζ = 0.65
 
-    signal_type: "chirp" or "multisine"
+    signal_type: "chirp", "multisine", or "step"
     """
     cfg = CFG
+
+    if signal_type == "step":
+        logger.info("── Demo mode ── synthetic plant with Step excitation")
+        gen = StepGenerator(cfg)
+        t, i_ref = gen.get_full_reference()
+        i_meas   = _simulate_plant(t, i_ref, cfg)
+
+        step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
+        m = step_data["metrics"]
+        logger.info(
+            f"Demo Step metrics: t_rise={m['t_rise']*1e3:.2f}ms  "
+            f"OS={m['overshoot_pct']:.1f}%  "
+            f"t_settle={m['t_settle']*1e3:.2f}ms"
+        )
+
+        save_npz = "step_response_raw.npz"
+        np.savez(
+            save_npz,
+            t=t, i_ref=i_ref, i_meas=i_meas,
+            t_step=step_data["t_step"],
+            avg=step_data["avg"],
+            signal_type=np.array("step"),
+            **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
+            **{f"metric_{k}": np.array([v]) for k, v in m.items()
+               if v is not None},
+        )
+        logger.info(f"Raw data saved → {save_npz}")
+
+        plot_step_results(t, i_ref, i_meas, step_data, cfg)
+        return
+
     est = FRFEstimator(cfg)
 
     if signal_type == "multisine":
@@ -973,10 +1295,19 @@ class BandwidthMeasurement:
         self.estimator   = FRFEstimator(cfg)
 
     def run(self) -> dict:
+        cfg = self.cfg
+        is_step = self.signal_type == "step"
+
+        if is_step:
+            total_dur = (cfg.step_settle + cfg.step_hold) * cfg.step_repeats
+        else:
+            total_dur = cfg.chirp_duration
+
         logger.info("=" * 58)
         logger.info("BLDC Current Controller  Bandwidth Measurement")
-        logger.info(f"  Chirp  {cfg.f_start}–{cfg.f_end} Hz  "
-                    f"{cfg.chirp_duration}s  A={cfg.amplitude}A")
+        logger.info(f"  Signal {self.signal_type}  "
+                    f"{'settle+hold' if is_step else f'{cfg.f_start}–{cfg.f_end} Hz'}  "
+                    f"{total_dur:.1f}s  A={cfg.amplitude}A")
         logger.info(f"  UDP    {cfg.udp_host}:{cfg.udp_port}")
         logger.info("=" * 58)
 
@@ -984,8 +1315,8 @@ class BandwidthMeasurement:
         logger.info("Waiting 2 s for UDP stream …")
         time.sleep(2.0)
 
-        logger.info(f"Recording {self.cfg.chirp_duration + 2.0:.0f} s …")
-        time.sleep(self.cfg.chirp_duration + 2.0)
+        logger.info(f"Recording {total_dur + 2.0:.0f} s …")
+        time.sleep(total_dur + 2.0)
 
         self.receiver.stop()
         logger.info(f"UDP stats: {self.receiver.stats()}")
@@ -993,7 +1324,37 @@ class BandwidthMeasurement:
         data = self.receiver.get_data()
         logger.info(f"Collected {len(data)} samples")
 
-        t, i_ref, i_meas = preprocess(data, self.cfg.fs)
+        t, i_ref, i_meas = preprocess(data, cfg.fs)
+
+        if is_step:
+            step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
+            m = step_data["metrics"]
+
+            logger.info("=" * 58)
+            if m["t_rise"] is not None:
+                logger.info(f"  ★  Rise time   :  {m['t_rise']*1e3:.2f} ms")
+            if m["overshoot_pct"] is not None:
+                logger.info(f"  ★  Overshoot   :  {m['overshoot_pct']:.1f} %")
+            if m["t_settle"] is not None:
+                logger.info(f"  ★  Settle time :  {m['t_settle']*1e3:.2f} ms")
+            logger.info("=" * 58)
+
+            save_npz = "step_response_raw.npz"
+            np.savez(
+                save_npz,
+                t=t, i_ref=i_ref, i_meas=i_meas,
+                t_step=step_data["t_step"],
+                avg=step_data["avg"],
+                signal_type=np.array("step"),
+                **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
+                **{f"metric_{k}": np.array([v]) for k, v in m.items()
+                   if v is not None},
+            )
+            logger.info(f"Raw data saved → {save_npz}")
+
+            plot_step_results(t, i_ref, i_meas, step_data, cfg)
+            return step_data["metrics"]
+
         frf = self.estimator.estimate(t, i_ref, i_meas)
 
         logger.info("=" * 58)
@@ -1029,9 +1390,10 @@ if __name__ == "__main__":
         help="Run with synthetic 2nd-order plant (no hardware needed)",
     )
     parser.add_argument(
-        "--signal", choices=["chirp", "multisine"],
+        "--signal", choices=["chirp", "multisine", "step"],
         default="chirp",
-        help="Excitation signal type (default: chirp).",
+        help="Excitation signal type (default: chirp). "
+             "'step' runs time-domain step response test.",
     )
     parser.add_argument(
         "--compare", nargs=2, metavar="NPZ",
