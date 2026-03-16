@@ -15,6 +15,8 @@
 #include "lwip/ip_addr.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 /* ════════════════════════════════════════════════════════════════
  * Lock-free SPSC Ring Buffer
@@ -145,6 +147,33 @@ void udp_print(const void *data, uint16_t len)
     if (ring_write(&s_ring, data, len) != 0) {
         s_stats.stream_overflow++;
     }
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * Public API: udp_printf()
+ * ════════════════════════════════════════════════════════════════ */
+
+int udp_printf(const char *fmt, ...)
+{
+    if (fmt == NULL) {
+        return -1;
+    }
+
+    char buf[UDP_STREAM_MAX_PKT];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    if (len < 0) {
+        return -1;
+    }
+
+    /* Truncate to buffer size (vsnprintf returns what it *would* have written) */
+    uint16_t send_len = (len < (int)sizeof(buf)) ? (uint16_t)len : (uint16_t)(sizeof(buf) - 1);
+
+    udp_print(buf, send_len);
+    return (int)send_len;
 }
 
 /* ════════════════════════════════════════════════════════════════
