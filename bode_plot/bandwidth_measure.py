@@ -761,11 +761,12 @@ def plot_results(
     save_path: str = "bandwidth_result.png",
 ) -> None:
     """
-    Three-panel figure
-    ──────────────────
-    Left-top    : Bode Magnitude  (log-x, dB)
-    Right-top   : Bode Phase      (log-x, deg, unwrapped)
-    Bottom-full : Step response   (IFFT-estimated, ms)
+    Four-panel figure
+    ─────────────────
+    [0,0] Bode Magnitude  (log-x, dB)
+    [0,1] Bode Phase      (log-x, deg, unwrapped)
+    [1,:] Time-domain ref vs measured
+    [2,:] Step response   (IFFT-estimated, ms)
     """
     _apply_style()
 
@@ -809,7 +810,7 @@ def plot_results(
     metrics        = _step_metrics(t_step, s_step)
 
     # ── Figure ──────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 9), dpi=140)
+    fig = plt.figure(figsize=(14, 13), dpi=140)
     fig.patch.set_facecolor(_BG)
 
     # Suptitle
@@ -826,16 +827,16 @@ def plot_results(
     fig.suptitle(
         "BLDC Current Controller   ·   " + "   |   ".join(parts),
         color=_TXT, fontsize=10.5, fontweight="bold",
-        y=0.985, x=0.5,
+        y=0.99, x=0.5,
     )
 
     gs = gridspec.GridSpec(
-        2, 2,
+        3, 2,
         figure=fig,
-        height_ratios=[1.0, 1.15],
-        hspace=0.48, wspace=0.28,
+        height_ratios=[1.0, 0.8, 1.0],
+        hspace=0.45, wspace=0.28,
         left=0.07, right=0.97,
-        top=0.94, bottom=0.08,
+        top=0.96, bottom=0.05,
     )
 
     # ════════════════════════════════════════════════════════
@@ -940,9 +941,26 @@ def plot_results(
     ax_ph.xaxis.set_minor_formatter(ticker.NullFormatter())
 
     # ════════════════════════════════════════════════════════
-    # [1, :]  Step response  (full width)
+    # [1, :]  Time-domain  ref vs measured  (full width)
     # ════════════════════════════════════════════════════════
-    ax_step = fig.add_subplot(gs[1, :])
+    ax_td = fig.add_subplot(gs[1, :])
+    _style_ax(ax_td)
+
+    t_plot = t * 1e3  # convert to ms
+    ax_td.plot(t_plot, i_ref,  color=_BLUE,  lw=1.2, alpha=0.8,
+               label="i_ref (reference)")
+    ax_td.plot(t_plot, i_meas, color=_GREEN, lw=1.0, alpha=0.7,
+               label="i_meas (measured)")
+
+    ax_td.set_xlabel("Time [ms]")
+    ax_td.set_ylabel("Current [A]")
+    ax_td.set_title("Time Domain  —  Reference vs Measured")
+    ax_td.legend(loc="upper right", handlelength=1.6)
+
+    # ════════════════════════════════════════════════════════
+    # [2, :]  Step response  (full width)
+    # ════════════════════════════════════════════════════════
+    ax_step = fig.add_subplot(gs[2, :])
     _style_ax(ax_step)
 
     # Main step curve
