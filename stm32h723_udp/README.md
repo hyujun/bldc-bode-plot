@@ -8,6 +8,7 @@ STM32H723 + LwIP + FreeRTOS + Netconn API 기반 고속 UDP 통신 예제 코드
 |------|------|------|---------|
 | 51550 | TX only | 1kHz 스트리밍 (udp_print) | BelowNormal |
 | 51551 | RX/TX | Command-Response | AboveNormal |
+| 55150 | TX only | Bandwidth 측정 데이터 (text) | — |
 
 ## 파일 구조
 
@@ -44,6 +45,60 @@ TIM6 ISR (1kHz)
                     └─────────────────────────────┘
 
 PC ──► Port 51551 ──► udp_cmd_task (AboveNormal) ──► handler callback ──► Response
+```
+
+## Bandwidth Measurement 프로토콜 (Port 55150)
+
+`bandwidth_measure.py`와 연동하여 전류 제어기의 주파수 응답을 측정합니다.
+
+### 데이터 포맷
+
+텍스트 기반 UDP 패킷 (UTF-8):
+
+```
+chirp: t=0.001, ref=0.050, cur=0.048
+MSine: t=0.002, ref=0.100, cur=0.095
+Step:  t=0.003, ref=0.300, cur=0.290
+```
+
+### Control Messages
+
+STM32가 측정 phase 전환 시 전송하는 제어 메시지:
+
+```
+bandwidth measure start                    → 측정 시작
+chirp done, transition to multisine        → Chirp → Multisine 전환
+Multisine done, transition to step         → Multisine → Step 전환
+step done, bandwidth measure completed     → 전체 측정 완료
+```
+
+Python 측은 이 메시지를 수신하여 phase별 데이터를 자동 분리하고, 각 phase마다 독립적으로 FRF estimation을 수행합니다.
+
+### 측정 시퀀스
+
+```
+STM32                                Desktop (bandwidth_measure.py)
+  │                                       │
+  ├─ "bandwidth measure start" ──────────►│  수신 대기 시작
+  │                                       │
+  ├─ chirp: t=..., ref=..., cur=... ────►│  chirp 데이터 수집
+  │  (30초간 1kHz)                        │
+  │                                       │
+  ├─ "chirp done, transition to ..." ───►│  chirp phase 종료
+  │                                       │
+  ├─ MSine: t=..., ref=..., cur=... ───►│  multisine 데이터 수집
+  │  (30초간 1kHz)                        │
+  │                                       │
+  ├─ "Multisine done, transition ..." ──►│  multisine phase 종료
+  │                                       │
+  ├─ Step: t=..., ref=..., cur=... ────►│  step 데이터 수집
+  │  (3.5초간)                            │
+  │                                       │
+  ├─ "step done, bandwidth ..." ────────►│  측정 완료
+  │                                       │  → noise analysis
+  │                                       │  → adaptive preprocessing
+  │                                       │  → FRF estimation
+  │                                       │  → Bode/Step/Nyquist plot
 ```
 
 ## Task 우선순위
@@ -146,6 +201,14 @@ while True:
     if pkt_id == 0x01:  # current
         ts, i_ref, i_meas = struct.unpack_from('<Iff', data, 1)
         print(f"t={ts} i_ref={i_ref:.3f} i_meas={i_meas:.3f}")
+
+# Port 55150 수신 (bandwidth measurement)
+bw_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+bw_sock.bind(('0.0.0.0', 55150))
+while True:
+    data, addr = bw_sock.recvfrom(1024)
+    msg = data.decode('utf-8').strip()
+    print(msg)  # e.g. "chirp: t=0.001, ref=0.050, cur=0.048"
 
 # Port 51551 커맨드 (Read params)
 cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

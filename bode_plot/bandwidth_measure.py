@@ -17,11 +17,13 @@ Usage
 import argparse
 import csv
 import json
+import os
 import socket
 import re
 import threading
 import time
 import logging
+from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -78,6 +80,56 @@ class MeasurementConfig:
 
 
 CFG = MeasurementConfig()
+
+
+# ════════════════════════════════════════════════════════════
+# Output directory manager
+# ════════════════════════════════════════════════════════════
+class OutputManager:
+    """Create and manage a timestamped output directory.
+
+    Structure
+    ─────────
+      YYMMDD_HHMM/
+      ├── plots/    — .png visualization files
+      ├── data/     — .npz raw data files
+      └── export/   — .csv, .json exported files
+    """
+
+    _SUBDIRS = {
+        ".png": "plots",
+        ".npz": "data",
+        ".csv": "export",
+        ".json": "export",
+    }
+
+    def __init__(self, base_dir: str = "."):
+        stamp = datetime.now().strftime("%y%m%d_%H%M")
+        self.root = os.path.join(base_dir, stamp)
+        self._created: set[str] = set()
+
+    def _ensure_dir(self, subdir: str) -> None:
+        path = os.path.join(self.root, subdir)
+        if path not in self._created:
+            os.makedirs(path, exist_ok=True)
+            self._created.add(path)
+
+    def path(self, filename: str) -> str:
+        """Return full path for *filename*, placed in the correct subdirectory."""
+        ext = os.path.splitext(filename)[1].lower()
+        subdir = self._SUBDIRS.get(ext, "")
+        self._ensure_dir(subdir)
+        return os.path.join(self.root, subdir, filename)
+
+    def log_structure(self) -> None:
+        """Log the output directory tree."""
+        logger.info(f"Output directory → {self.root}/")
+        for subdir in sorted(set(self._SUBDIRS.values())):
+            d = os.path.join(self.root, subdir)
+            if os.path.isdir(d):
+                files = os.listdir(d)
+                if files:
+                    logger.info(f"  {subdir}/ ({len(files)} files)")
 
 
 # ════════════════════════════════════════════════════════════
@@ -2292,10 +2344,12 @@ def _simulate_plant(t, i_ref, cfg, rng_seed=42, noisy=False):
 
 
 def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
-                     noisy: bool = False) -> Optional[dict]:
+                     noisy: bool = False,
+                     out: Optional[OutputManager] = None) -> Optional[dict]:
     """Run demo for a single signal type. Returns frf dict or step metrics."""
     est = FRFEstimator(cfg)
     noise_tag = " (noisy + adaptive)" if noisy else ""
+    _p = out.path if out else lambda f: f  # path resolver
 
     if signal_type == "step":
         logger.info(f"── Demo ── Step excitation{noise_tag}")
@@ -2310,7 +2364,7 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
             preprocessor = AdaptivePreprocessor(cfg)
             i_meas_clean = preprocessor.apply(i_meas, report, i_ref=i_ref)
             plot_noise_analysis(t, i_ref, i_meas, i_meas_clean, report, cfg,
-                                save_path="noise_analysis_step.png")
+                                save_path=_p("noise_analysis_step.png"))
             i_meas = i_meas_clean
 
         step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
@@ -2325,7 +2379,7 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
             f"t_settle={m['t_settle']*1e3:.2f}ms"
         )
 
-        save_npz = "step_response_raw.npz"
+        save_npz = _p("step_response_raw.npz")
         save_dict = dict(
             t=t, i_ref=i_ref, i_meas=i_meas,
             t_step=step_data["t_step"],
@@ -2348,7 +2402,8 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
             )
         np.savez(save_npz, **save_dict)
         logger.info(f"  Raw data saved → {save_npz}")
-        plot_step_results(t, i_ref, i_meas, step_data, cfg)
+        plot_step_results(t, i_ref, i_meas, step_data, cfg,
+                          save_path=_p("step_response_result.png"))
         return step_data["metrics"]
 
     if signal_type == "multisine":
@@ -2371,7 +2426,7 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
         i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
 
         plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
-                            cfg, save_path=f"noise_analysis_{signal_type}.png")
+                            cfg, save_path=_p(f"noise_analysis_{signal_type}.png"))
 
         # Use filtered data for FRF estimation
         i_meas = i_meas_filtered
@@ -2380,7 +2435,7 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
 
     logger.info(f"  BW estimate : {frf['bandwidth_hz']:.1f} Hz  (true: ~180 Hz)")
 
-    save_npz = f"bandwidth_raw_{signal_type}.npz"
+    save_npz = _p(f"bandwidth_raw_{signal_type}.npz")
     np.savez(
         save_npz,
         t=t, i_ref=i_ref, i_meas=i_meas,
@@ -2392,7 +2447,7 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
     )
     logger.info(f"  Raw data saved → {save_npz}")
     plot_results(t, i_ref, i_meas, frf, cfg=cfg,
-                 save_path=f"bandwidth_result_{signal_type}.png")
+                 save_path=_p(f"bandwidth_result_{signal_type}.png"))
     return frf
 
 
@@ -2405,18 +2460,24 @@ def _run_demo(signal_type: str = "all", noisy: bool = False) -> None:
     signal_type: "all", "chirp", "multisine", or "step"
     """
     cfg = CFG
+    out = OutputManager()
 
     if signal_type == "all":
         logger.info("── Demo mode ── sequential: chirp → multisine → step")
         for sig in ("chirp", "multisine", "step"):
-            _run_demo_single(sig, cfg, noisy=noisy)
+            frf = _run_demo_single(sig, cfg, noisy=noisy, out=out)
+            # Export CSV/JSON for FRF results (not step metrics)
+            if isinstance(frf, dict) and "f" in frf:
+                export_csv(frf, path=out.path(f"bandwidth_result_{sig}.csv"))
+                export_json(frf, path=out.path(f"bandwidth_result_{sig}.json"))
     else:
         logger.info(f"── Demo mode ── single signal: {signal_type}")
-        _run_demo_single(signal_type, cfg, noisy=noisy)
+        frf = _run_demo_single(signal_type, cfg, noisy=noisy, out=out)
+        if isinstance(frf, dict) and "f" in frf:
+            export_csv(frf, path=out.path(f"bandwidth_result_{signal_type}.csv"))
+            export_json(frf, path=out.path(f"bandwidth_result_{signal_type}.json"))
 
-    # Export CSV/JSON alongside npz
-    export_csv(frf, path=f"bandwidth_result_{signal_type}.csv")
-    export_json(frf, path=f"bandwidth_result_{signal_type}.json")
+    out.log_structure()
 
 
 # ════════════════════════════════════════════════════════════
@@ -2435,6 +2496,7 @@ class BandwidthMeasurement:
         self.signal_type = signal_type
         self.receiver    = UDPReceiver(cfg)
         self.estimator   = FRFEstimator(cfg)
+        self.out         = OutputManager()
 
     # ── helpers ───────────────────────────────────────────
     def _analyze_frf_phase(self, phase: str, data: list) -> Optional[dict]:
@@ -2455,7 +2517,8 @@ class BandwidthMeasurement:
         i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
 
         plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
-                            self.cfg, save_path=f"noise_analysis_{phase}.png")
+                            self.cfg,
+                            save_path=self.out.path(f"noise_analysis_{phase}.png"))
 
         i_meas = i_meas_filtered
 
@@ -2465,7 +2528,7 @@ class BandwidthMeasurement:
                     f"(estimator={frf.get('estimator', 'H1')}, "
                     f"nperseg={frf.get('nperseg_used', self.cfg.nperseg)})")
 
-        save_npz = f"bandwidth_raw_{phase}.npz"
+        save_npz = self.out.path(f"bandwidth_raw_{phase}.npz")
         np.savez(
             save_npz,
             t=t, i_ref=i_ref, i_meas=i_meas,
@@ -2478,10 +2541,10 @@ class BandwidthMeasurement:
         logger.info(f"  Raw data saved → {save_npz}")
 
         plot_results(t, i_ref, i_meas, frf, cfg=self.cfg,
-                     save_path=f"bandwidth_result_{phase}.png")
+                     save_path=self.out.path(f"bandwidth_result_{phase}.png"))
 
-        export_csv(frf, path=f"bandwidth_result_{phase}.csv")
-        export_json(frf, path=f"bandwidth_result_{phase}.json")
+        export_csv(frf, path=self.out.path(f"bandwidth_result_{phase}.csv"))
+        export_json(frf, path=self.out.path(f"bandwidth_result_{phase}.json"))
         return frf
 
     def _analyze_step_phase(self, data: list) -> Optional[dict]:
@@ -2502,7 +2565,8 @@ class BandwidthMeasurement:
         i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
 
         plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
-                            self.cfg, save_path="noise_analysis_step.png")
+                            self.cfg,
+                            save_path=self.out.path("noise_analysis_step.png"))
 
         i_meas = i_meas_filtered
 
@@ -2519,7 +2583,7 @@ class BandwidthMeasurement:
         if m["t_settle"] is not None:
             logger.info(f"  ★  [step] Settle time : {m['t_settle']*1e3:.2f} ms")
 
-        save_npz = "step_response_raw.npz"
+        save_npz = self.out.path("step_response_raw.npz")
         save_dict = dict(
             t=t, i_ref=i_ref, i_meas=i_meas,
             t_step=step_data["t_step"],
@@ -2543,7 +2607,8 @@ class BandwidthMeasurement:
         np.savez(save_npz, **save_dict)
         logger.info(f"  Raw data saved → {save_npz}")
 
-        plot_step_results(t, i_ref, i_meas, step_data, self.cfg)
+        plot_step_results(t, i_ref, i_meas, step_data, self.cfg,
+                          save_path=self.out.path("step_response_result.png"))
         return step_data["metrics"]
 
     # ── main entry ────────────────────────────────────────
@@ -2603,6 +2668,7 @@ class BandwidthMeasurement:
 
         logger.info("=" * 58)
         logger.info("Measurement complete — all phases processed")
+        self.out.log_structure()
         logger.info("=" * 58)
         return results
 
@@ -2660,21 +2726,30 @@ if __name__ == "__main__":
     if args.monitor:
         run_monitor(cfg)
     elif args.nyquist:
+        om  = OutputManager()
         frf = _load_frf_from_npz(args.nyquist)
-        plot_nyquist(frf, cfg)
+        plot_nyquist(frf, cfg, save_path=om.path("nyquist_result.png"))
+        om.log_structure()
     elif args.export_csv:
+        om  = OutputManager()
         frf = _load_frf_from_npz(args.export_csv)
-        out = args.export_csv.replace(".npz", ".csv")
-        export_csv(frf, path=out)
+        base = os.path.splitext(os.path.basename(args.export_csv))[0]
+        export_csv(frf, path=om.path(f"{base}.csv"))
+        om.log_structure()
     elif args.export_json:
+        om  = OutputManager()
         frf = _load_frf_from_npz(args.export_json)
-        out = args.export_json.replace(".npz", ".json")
-        export_json(frf, path=out)
+        base = os.path.splitext(os.path.basename(args.export_json))[0]
+        export_json(frf, path=om.path(f"{base}.json"))
+        om.log_structure()
     elif args.compare:
+        om  = OutputManager()
         frf_a = _load_frf_from_npz(args.compare[0])
         frf_b = _load_frf_from_npz(args.compare[1])
         logger.info(f"Comparing: {args.compare[0]} vs {args.compare[1]}")
-        plot_comparison(frf_a, frf_b, cfg)
+        plot_comparison(frf_a, frf_b, cfg,
+                        save_path=om.path("bandwidth_comparison.png"))
+        om.log_structure()
     elif args.demo:
         _run_demo(signal_type=args.signal, noisy=args.noisy)
     else:
