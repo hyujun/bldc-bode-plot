@@ -398,7 +398,8 @@ class FRFEstimator:
 def preprocess(
     data: list[DataPoint],
     fs: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Returns (t_uniform, i_ref, i_meas, fs_detected)."""
     if len(data) < 100:
         raise ValueError(f"Too few data points: {len(data)}")
 
@@ -412,6 +413,27 @@ def preprocess(
     _, uniq = np.unique(t_r, return_index=True)
     t_r, ref_r, meas_r = t_r[uniq], ref_r[uniq], meas_r[uniq]
 
+    # ── Auto-detect sampling frequency from timestamps ──
+    dt_arr = np.diff(t_r)
+    dt_arr = dt_arr[dt_arr > 0]  # discard zero-diff
+    if len(dt_arr) > 0:
+        dt_median = float(np.median(dt_arr))
+        fs_detected = round(1.0 / dt_median, 1)
+        if abs(fs_detected - fs) / max(fs, 1.0) > 0.05:
+            logger.info(
+                f"Auto-detected fs = {fs_detected:.1f} Hz "
+                f"(dt_median = {dt_median*1e3:.3f} ms), "
+                f"overriding configured fs = {fs:.1f} Hz"
+            )
+        else:
+            logger.info(
+                f"Detected fs = {fs_detected:.1f} Hz "
+                f"(matches configured {fs:.1f} Hz)"
+            )
+        fs = fs_detected
+    else:
+        logger.warning("Cannot detect fs from timestamps, using configured value")
+
     t_u   = np.arange(t_r[0], t_r[-1], 1.0/fs)
     i_ref  = np.interp(t_u, t_r, ref_r)
     i_meas = np.interp(t_u, t_r, meas_r)
@@ -420,7 +442,7 @@ def preprocess(
     loss_pct = 100.0 * (1 - len(t_r)/max(expected,1))
     logger.info(f"Packet loss {loss_pct:.1f} % ({expected-len(t_r)}/{expected})")
 
-    return t_u, i_ref, i_meas
+    return t_u, i_ref, i_meas, fs
 
 
 # ════════════════════════════════════════════════════════════
@@ -1389,7 +1411,8 @@ class BandwidthMeasurement:
         data = self.receiver.get_data()
         logger.info(f"Collected {len(data)} samples")
 
-        t, i_ref, i_meas = preprocess(data, cfg.fs)
+        t, i_ref, i_meas, fs_detected = preprocess(data, cfg.fs)
+        cfg.fs = fs_detected
 
         if is_step:
             step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
