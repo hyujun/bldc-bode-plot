@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MeasurementConfig:
     # UDP
-    udp_host: str        = "192.168.1.2"
+    udp_host: str        = "0.0.0.0"
     udp_port: int        = 55150
     udp_buffer_size: int = 1024
 
