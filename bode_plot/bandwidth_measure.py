@@ -15,6 +15,8 @@ Usage
 """
 
 import argparse
+import csv
+import json
 import socket
 import re
 import threading
@@ -24,9 +26,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as ticker
+from matplotlib.animation import FuncAnimation
 from scipy import signal
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional
 
 logging.basicConfig(
@@ -253,78 +256,80 @@ class UDPReceiver:
 
     def _run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        sock.bind((self.cfg.udp_host, self.cfg.udp_port))
-        sock.settimeout(0.5)
-        collecting = False
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            sock.bind((self.cfg.udp_host, self.cfg.udp_port))
+            sock.settimeout(0.5)
+            collecting = False
 
-        while not self._stop.is_set():
-            try:
-                raw, _ = sock.recvfrom(self.cfg.udp_buffer_size)
-                msg = raw.decode("utf-8", errors="replace").strip()
-                msg_lower = msg.lower()
+            while not self._stop.is_set():
+                try:
+                    raw, _ = sock.recvfrom(self.cfg.udp_buffer_size)
+                    msg = raw.decode("utf-8", errors="replace").strip()
+                    msg_lower = msg.lower()
 
-                # ── start messages ────────────────────────
-                if _MSG_START.lower() in msg_lower or _MSG_LEGACY_START.lower() in msg_lower:
-                    collecting = True
-                    self._current_phase = "chirp"
-                    self._started.set()
-                    logger.info(f"Received: {msg}")
+                    # ── start messages ────────────────────────
+                    if _MSG_START.lower() in msg_lower or _MSG_LEGACY_START.lower() in msg_lower:
+                        collecting = True
+                        self._current_phase = "chirp"
+                        self._started.set()
+                        logger.info(f"Received: {msg}")
+                        continue
+
+                    # ── transition: chirp → multisine ─────────
+                    if _MSG_CHIRP_DONE.lower() in msg_lower:
+                        self._phase_done["chirp"].set()
+                        self._current_phase = "multisine"
+                        logger.info(f"Received: {msg}")
+                        continue
+
+                    # ── transition: multisine → step ──────────
+                    if _MSG_MULTISINE_DONE.lower() in msg_lower:
+                        self._phase_done["multisine"].set()
+                        self._current_phase = "step"
+                        logger.info(f"Received: {msg}")
+                        continue
+
+                    # ── end messages ──────────────────────────
+                    if (_MSG_ALL_DONE.lower() in msg_lower
+                            or _MSG_LEGACY_DONE.lower() in msg_lower):
+                        self._phase_done["step"].set()
+                        collecting = False
+                        self._current_phase = None
+                        self._done.set()
+                        logger.info(f"Received: {msg}")
+                        continue
+
+                    if not collecting:
+                        continue
+
+                    # ── data line ─────────────────────────────
+                    m = _DATA_RE.search(msg)
+                    if not m:
+                        self._drop += 1
+                        continue
+
+                    t_val  = float(m.group(1))
+                    i_ref  = float(m.group(2))
+                    i_meas = float(m.group(3))
+
+                    if abs(i_meas) > self.cfg.max_current * 3:
+                        self._drop += 1
+                        continue
+
+                    phase = self._classify_phase(msg) or self._current_phase
+                    with self._lock:
+                        self.buffer.append(DataPoint(t_val, i_ref, i_meas))
+                        if phase and phase in self._phase_buffers:
+                            self._phase_buffers[phase].append(
+                                DataPoint(t_val, i_ref, i_meas))
+                    self._rx += 1
+                except socket.timeout:
                     continue
-
-                # ── transition: chirp → multisine ─────────
-                if _MSG_CHIRP_DONE.lower() in msg_lower:
-                    self._phase_done["chirp"].set()
-                    self._current_phase = "multisine"
-                    logger.info(f"Received: {msg}")
-                    continue
-
-                # ── transition: multisine → step ──────────
-                if _MSG_MULTISINE_DONE.lower() in msg_lower:
-                    self._phase_done["multisine"].set()
-                    self._current_phase = "step"
-                    logger.info(f"Received: {msg}")
-                    continue
-
-                # ── end messages ──────────────────────────
-                if (_MSG_ALL_DONE.lower() in msg_lower
-                        or _MSG_LEGACY_DONE.lower() in msg_lower):
-                    self._phase_done["step"].set()
-                    collecting = False
-                    self._current_phase = None
-                    self._done.set()
-                    logger.info(f"Received: {msg}")
-                    continue
-
-                if not collecting:
-                    continue
-
-                # ── data line ─────────────────────────────
-                m = _DATA_RE.search(msg)
-                if not m:
-                    self._drop += 1
-                    continue
-
-                t_val  = float(m.group(1))
-                i_ref  = float(m.group(2))
-                i_meas = float(m.group(3))
-
-                if abs(i_meas) > self.cfg.max_current * 3:
-                    self._drop += 1
-                    continue
-
-                phase = self._classify_phase(msg) or self._current_phase
-                with self._lock:
-                    self.buffer.append(DataPoint(t_val, i_ref, i_meas))
-                    if phase and phase in self._phase_buffers:
-                        self._phase_buffers[phase].append(
-                            DataPoint(t_val, i_ref, i_meas))
-                self._rx += 1
-            except socket.timeout:
-                continue
-            except Exception as e:
-                logger.error(f"UDP error: {e}")
-        sock.close()
+                except Exception as e:
+                    logger.error(f"UDP error: {e}")
+        finally:
+            sock.close()
 
 
 # ════════════════════════════════════════════════════════════
@@ -357,7 +362,8 @@ class MultisineGenerator:
 
     x(t) = (A / √N) · Σ cos(2π·f_k·t + φ_k) + dc_bias
 
-    - Frequencies f_k are logarithmically spaced in [f_start, f_end]
+    - Frequencies f_k are snapped to DFT bins (k·fs/nperseg) to eliminate
+      spectral leakage, then log-approximately spaced in [f_start, f_end]
     - Schroeder phases φ_k = −k(k−1)π/N minimize crest factor
     - Duration matches chirp_duration for fair comparison
     """
@@ -365,13 +371,26 @@ class MultisineGenerator:
     def __init__(self, cfg: MeasurementConfig, n_freqs: int = 60):
         self.cfg     = cfg
         self.n_freqs = n_freqs
-        self.freqs   = np.geomspace(cfg.f_start, cfg.f_end, n_freqs)
+        self.freqs   = self._snap_to_dft_bins(cfg, n_freqs)
         self.t_arr   = np.arange(0, cfg.chirp_duration, 1.0 / cfg.fs)
         self.i_ref_arr = self._generate()
 
+    @staticmethod
+    def _snap_to_dft_bins(cfg: MeasurementConfig, n_freqs: int) -> np.ndarray:
+        """Snap log-spaced target frequencies to nearest DFT bin centres."""
+        df          = cfg.fs / cfg.nperseg          # bin resolution
+        f_targets   = np.geomspace(cfg.f_start, cfg.f_end, n_freqs)
+        bin_indices = np.round(f_targets / df).astype(int)
+        bin_indices = np.unique(bin_indices)         # remove duplicates
+        freqs       = bin_indices * df
+        # Filter to valid range
+        freqs = freqs[(freqs >= cfg.f_start) & (freqs <= cfg.f_end)]
+        return freqs
+
     def _generate(self) -> np.ndarray:
         c = self.cfg
-        N = self.n_freqs
+        N = len(self.freqs)
+        self.n_freqs = N  # update after dedup
         # Schroeder phases for low crest factor
         k      = np.arange(N)
         phases = -k * (k - 1) * np.pi / N
@@ -444,9 +463,14 @@ class FRFEstimator:
         t: np.ndarray,
         i_ref: np.ndarray,
         i_meas: np.ndarray,
+        noise_report: Optional[NoiseReport] = None,
     ) -> dict:
         fs      = self.cfg.fs
-        nperseg = min(self.cfg.nperseg, len(i_ref) // 4)
+
+        # Use adaptive nperseg if NoiseReport recommends it
+        base_nperseg = (noise_report.recommended_nperseg
+                        if noise_report else self.cfg.nperseg)
+        nperseg = min(base_nperseg, len(i_ref) // 4)
         noverlap= min(self.cfg.noverlap, nperseg // 2)
         kw      = dict(fs=fs, window=self.cfg.window,
                        nperseg=nperseg, noverlap=noverlap)
@@ -455,19 +479,42 @@ class FRFEstimator:
         f,  Sxx = signal.welch(i_ref,         **kw)
         _,  Sxy = signal.csd(i_ref, i_meas,   **kw)
         _,  Syy = signal.welch(i_meas,        **kw)
+        _,  Syx = signal.csd(i_meas, i_ref,   **kw)
 
-        H          = Sxy / (Sxx + eps)
+        # H1 estimator (robust to output noise)
+        H1         = Sxy / (Sxx + eps)
+        # H2 estimator (robust to input noise)
+        H2         = Syy / (Syx + eps)
+
+        # Select estimator based on noise analysis
+        use_hv = (noise_report is not None
+                  and noise_report.recommended_estimator == "Hv")
+        if use_hv:
+            # Hv = geometric mean of H1 and H2 (robust to noise on both)
+            H = np.sqrt(H1 * H2)
+            logger.info(f"  FRF: using Hv estimator  (nperseg={nperseg})")
+        else:
+            H = H1
+            if noise_report:
+                logger.info(f"  FRF: using H1 estimator  (nperseg={nperseg})")
+
         mag_db     = 20 * np.log10(np.abs(H) + eps)
         phase_deg  = np.degrees(np.unwrap(np.angle(H)))
-        coherence  = np.abs(Sxy)**2 / (Sxx * Syy + eps)
+        coherence  = np.clip(np.abs(Sxy)**2 / (Sxx * Syy + eps), 0.0, 1.0)
         valid      = coherence > self.cfg.coh_threshold
 
         bw_hz      = self._bandwidth(f, mag_db, valid)
 
+        # Gain margin: gain at phase = -180° crossover
+        gain_margin, f_gm = self._gain_margin(f, mag_db, phase_deg, valid)
+
         return dict(
-            f=f, H=H, mag_db=mag_db,
+            f=f, H=H, H1=H1, H2=H2, mag_db=mag_db,
             phase_deg=phase_deg, coherence=coherence,
             valid=valid, bandwidth_hz=bw_hz,
+            gain_margin_db=gain_margin, f_gain_margin=f_gm,
+            estimator="Hv" if use_hv else "H1",
+            nperseg_used=nperseg,
         )
 
     def _bandwidth(
@@ -477,7 +524,6 @@ class FRFEstimator:
         valid: np.ndarray,
     ) -> float:
         cfg  = self.cfg
-        eps  = 1e-12
         rmask = valid & (f >= cfg.ref_f_low) & (f <= cfg.ref_f_high)
         ref_db = float(np.mean(mag_db[rmask])) if np.any(rmask) else 0.0
 
@@ -489,8 +535,431 @@ class FRFEstimator:
         if idx > 0:
             f0, f1 = float(f[idx-1]), float(f[idx])
             m0, m1 = float(mag_db[idx-1]), float(mag_db[idx])
-            return f0 + (f1-f0) * (ref_db-3.0-m0) / (m1-m0+eps)
+            dm = m1 - m0
+            if abs(dm) < 1e-6:
+                return f0
+            return f0 + (f1-f0) * (ref_db-3.0-m0) / dm
         return float(f[idx])
+
+    def _gain_margin(
+        self,
+        f: np.ndarray,
+        mag_db: np.ndarray,
+        phase_deg: np.ndarray,
+        valid: np.ndarray,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Find gain margin at -180° phase crossover."""
+        cfg = self.cfg
+        fmsk = valid & (f >= cfg.f_start) & (f <= cfg.f_end)
+        for i in range(len(phase_deg) - 1):
+            if not fmsk[i]:
+                continue
+            if phase_deg[i] >= -180.0 >= phase_deg[i+1]:
+                # Interpolate frequency at -180°
+                dp = phase_deg[i+1] - phase_deg[i]
+                if abs(dp) < 1e-6:
+                    f_cross = float(f[i])
+                else:
+                    frac = (-180.0 - phase_deg[i]) / dp
+                    f_cross = float(f[i] + (f[i+1] - f[i]) * frac)
+                mag_at_cross = float(
+                    mag_db[i] + (mag_db[i+1] - mag_db[i]) * frac
+                    if abs(dp) >= 1e-6 else mag_db[i]
+                )
+                gain_margin = -mag_at_cross  # GM = -|H| at -180°
+                return gain_margin, f_cross
+        return None, None
+
+
+# ════════════════════════════════════════════════════════════
+# Noise analysis
+# ════════════════════════════════════════════════════════════
+@dataclass
+class NoiseReport:
+    """Results of automatic noise characterisation."""
+    snr_db: float                       # broadband SNR estimate
+    noise_rms: float                    # RMS of residual  (i_meas − trend)
+    signal_rms: float                   # RMS of signal content
+    spike_count: int                    # samples exceeding 4σ
+    spike_ratio: float                  # spike_count / total
+    tonal_peaks: list[float]            # frequencies of detected tonal peaks [Hz]
+    tonal_powers_db: list[float]        # power of each tonal peak [dB]
+    mean_coherence: float               # mean γ² in [f_start, f_end]
+    recommended_filters: list[str]      # list of filter names to apply
+    recommended_nperseg: int            # Welch segment length
+    recommended_estimator: str          # "H1" or "Hv"
+
+
+class NoiseAnalyzer:
+    """
+    Analyse raw i_meas to characterise noise and recommend preprocessing.
+
+    Pipeline
+    ────────
+    1. Compute error signal  e(t) = i_meas − i_ref  (noise + tracking error)
+    2. PSD of e(t) → detect tonal peaks (PWM harmonics, rotor ripple)
+    3. Statistics  → spike count, RMS, SNR
+    4. Quick coherence scan  → mean γ² in measurement band
+    5. Decision rules → recommend notch, median, nperseg, estimator
+    """
+
+    # Tonal peak must be this many dB above local median to be flagged
+    _PEAK_PROMINENCE_DB = 10.0
+    # Spike threshold in multiples of σ
+    _SPIKE_SIGMA = 4.0
+    # If mean coherence drops below this, switch to Hv estimator
+    _COH_HV_THRESHOLD = 0.85
+    # If spike ratio exceeds this, enable median filter
+    _SPIKE_RATIO_THRESHOLD = 0.005
+    # SNR below this triggers nperseg reduction (more averaging)
+    _LOW_SNR_DB = 15.0
+
+    def __init__(self, cfg: MeasurementConfig):
+        self.cfg = cfg
+
+    def analyze(
+        self,
+        t: np.ndarray,
+        i_ref: np.ndarray,
+        i_meas: np.ndarray,
+    ) -> NoiseReport:
+        cfg = self.cfg
+        fs  = cfg.fs
+
+        # ── 1. Error signal ──────────────────────────────────
+        error = i_meas - i_ref
+
+        # ── 2. Signal / noise RMS ────────────────────────────
+        signal_rms = float(np.sqrt(np.mean(i_ref ** 2)))
+        noise_rms  = float(np.sqrt(np.mean(error ** 2)))
+        eps = 1e-12
+        snr_db = float(20.0 * np.log10(signal_rms / (noise_rms + eps)))
+
+        # ── 3. Spike detection ───────────────────────────────
+        sigma  = float(np.std(error))
+        spikes = np.abs(error) > self._SPIKE_SIGMA * sigma
+        spike_count = int(np.sum(spikes))
+        spike_ratio = spike_count / max(len(error), 1)
+
+        # ── 4. PSD of error → tonal peak detection ──────────
+        nperseg_psd = min(2048, len(error) // 4)
+        f_psd, Pee = signal.welch(error, fs=fs, nperseg=nperseg_psd)
+
+        Pee_db = 10.0 * np.log10(Pee + eps)
+
+        # Local median in sliding window for adaptive threshold
+        win = max(15, nperseg_psd // 32)
+        if win % 2 == 0:
+            win += 1
+        from scipy.ndimage import median_filter as _medfilt1d
+        Pee_median = _medfilt1d(Pee_db, size=win)
+
+        prominence = Pee_db - Pee_median
+        peak_idx, _ = signal.find_peaks(
+            prominence,
+            height=self._PEAK_PROMINENCE_DB,
+            distance=max(3, int(5.0 / (fs / nperseg_psd))),  # ≥ 5 Hz apart
+        )
+
+        # Filter: only peaks outside reference band & within Nyquist
+        # Avoid notching frequencies in the reference band (ref_f_low–ref_f_high)
+        # as that would distort the FRF reference level
+        valid_peaks = [
+            i for i in peak_idx
+            if f_psd[i] > cfg.ref_f_high and f_psd[i] < fs / 2.0
+        ]
+        tonal_peaks     = [float(f_psd[i]) for i in valid_peaks]
+        tonal_powers_db = [float(Pee_db[i]) for i in valid_peaks]
+
+        # ── 5. Quick coherence estimate ──────────────────────
+        kw = dict(fs=fs, nperseg=nperseg_psd, noverlap=nperseg_psd // 2,
+                  window="hann")
+        f_c, Sxx = signal.welch(i_ref, **kw)
+        _,   Sxy = signal.csd(i_ref, i_meas, **kw)
+        _,   Syy = signal.welch(i_meas, **kw)
+        coh = np.clip(np.abs(Sxy)**2 / (Sxx * Syy + eps), 0.0, 1.0)
+
+        band = (f_c >= cfg.f_start) & (f_c <= cfg.f_end)
+        mean_coh = float(np.mean(coh[band])) if np.any(band) else 0.0
+
+        # ── 6. Decision rules ────────────────────────────────
+        filters = []
+
+        # Spikes → median filter (always first — outliers bias all estimates)
+        if spike_ratio > self._SPIKE_RATIO_THRESHOLD:
+            filters.append("median")
+
+        # Tonal peaks → notch filter ONLY when coherence is already high
+        # (meaning the tones leak into the CSD and bias H1).
+        # For broadband excitation (chirp/multisine), Welch's CSD
+        # naturally rejects uncorrelated tonal noise.
+        if tonal_peaks and mean_coh > 0.90:
+            filters.append("notch")
+
+        # Low SNR → LPF at f_end to remove out-of-band noise
+        if snr_db < self._LOW_SNR_DB:
+            filters.append("lowpass")
+
+        # nperseg: reduce for more averaging only when very noisy
+        if snr_db < 10.0:
+            rec_nperseg = max(512, cfg.nperseg // 2)
+        else:
+            rec_nperseg = cfg.nperseg
+
+        # Estimator: Hv only when coherence is very poor
+        rec_estimator = "Hv" if mean_coh < 0.70 else "H1"
+
+        report = NoiseReport(
+            snr_db=snr_db,
+            noise_rms=noise_rms,
+            signal_rms=signal_rms,
+            spike_count=spike_count,
+            spike_ratio=spike_ratio,
+            tonal_peaks=tonal_peaks,
+            tonal_powers_db=tonal_powers_db,
+            mean_coherence=mean_coh,
+            recommended_filters=filters,
+            recommended_nperseg=rec_nperseg,
+            recommended_estimator=rec_estimator,
+        )
+
+        self._log_report(report)
+        return report
+
+    @staticmethod
+    def _log_report(r: NoiseReport) -> None:
+        logger.info("── Noise analysis ─────────────────────────────")
+        logger.info(f"  SNR          : {r.snr_db:.1f} dB")
+        logger.info(f"  Signal RMS   : {r.signal_rms*1e3:.2f} mA")
+        logger.info(f"  Noise  RMS   : {r.noise_rms*1e3:.2f} mA")
+        logger.info(f"  Spikes       : {r.spike_count}  "
+                     f"({r.spike_ratio*100:.2f} %)")
+        if r.tonal_peaks:
+            peaks_str = ", ".join(f"{f:.1f} Hz" for f in r.tonal_peaks[:5])
+            if len(r.tonal_peaks) > 5:
+                peaks_str += f" (+{len(r.tonal_peaks)-5} more)"
+            logger.info(f"  Tonal peaks  : {peaks_str}")
+        else:
+            logger.info("  Tonal peaks  : none")
+        logger.info(f"  Mean γ²      : {r.mean_coherence:.3f}")
+        logger.info(f"  Filters      : {r.recommended_filters or 'none'}")
+        logger.info(f"  nperseg      : {r.recommended_nperseg}")
+        logger.info(f"  Estimator    : {r.recommended_estimator}")
+        logger.info("────────────────────────────────────────────────")
+
+
+# ════════════════════════════════════════════════════════════
+# Adaptive preprocessor
+# ════════════════════════════════════════════════════════════
+class AdaptivePreprocessor:
+    """
+    Apply filter chain selected by NoiseAnalyzer.
+
+    Available filters (applied in order):
+      1. median   — kernel=5 removes impulse spikes
+      2. notch    — 2nd-order IIR notch at each detected tonal peak
+      3. lowpass  — Butterworth LPF at f_end × 1.2  (remove OOB noise)
+    """
+
+    def __init__(self, cfg: MeasurementConfig):
+        self.cfg = cfg
+
+    def apply(
+        self,
+        i_meas: np.ndarray,
+        report: NoiseReport,
+        i_ref: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return filtered copy of i_meas.  i_ref is never filtered."""
+        x = i_meas.copy()
+        applied = []
+
+        # ── 1. Spike removal (interpolate outliers) ──────────
+        if "median" in report.recommended_filters:
+            # Use error signal for spike detection when i_ref available
+            if i_ref is not None:
+                residual = x - i_ref
+            else:
+                residual = x - np.median(x)
+            sigma = float(np.std(residual))
+            spike_mask = np.abs(residual) > 4.0 * sigma
+            n_fixed = int(np.sum(spike_mask))
+            if n_fixed > 0:
+                for idx in np.where(spike_mask)[0]:
+                    lo = max(0, idx - 2)
+                    hi = min(len(x), idx + 3)
+                    neighbors = [
+                        i for i in range(lo, hi)
+                        if i != idx and not spike_mask[i]
+                    ]
+                    if neighbors:
+                        x[idx] = np.mean(x[neighbors])
+            applied.append(f"despike(interpolated {n_fixed} outliers)")
+
+        # ── 2. Notch filters (tonal peaks) ───────────────────
+        if "notch" in report.recommended_filters and report.tonal_peaks:
+            fs = self.cfg.fs
+            for f_notch in report.tonal_peaks:
+                if f_notch <= 0 or f_notch >= fs / 2.0:
+                    continue
+                Q = max(30.0, f_notch / 3.0)  # narrow notch, Q scales with freq
+                b, a = signal.iirnotch(f_notch, Q, fs)
+                x = signal.filtfilt(b, a, x)
+                applied.append(f"notch({f_notch:.1f} Hz, Q={Q:.0f})")
+
+        # ── 3. Lowpass filter (OOB noise removal) ────────────
+        if "lowpass" in report.recommended_filters:
+            fs   = self.cfg.fs
+            f_lp = min(self.cfg.f_end * 1.2, fs / 2.0 - 1.0)
+            sos  = signal.butter(4, f_lp, btype="low", fs=fs, output="sos")
+            x    = signal.sosfiltfilt(sos, x)
+            applied.append(f"lowpass({f_lp:.0f} Hz, 4th-order Butterworth)")
+
+        if applied:
+            logger.info("  Applied filters: " + " → ".join(applied))
+        else:
+            logger.info("  No filtering needed (clean signal)")
+
+        return x
+
+
+# ════════════════════════════════════════════════════════════
+# Noise analysis plot
+# ════════════════════════════════════════════════════════════
+def plot_noise_analysis(
+    t: np.ndarray,
+    i_ref: np.ndarray,
+    i_meas: np.ndarray,
+    i_meas_filtered: np.ndarray,
+    report: NoiseReport,
+    cfg: MeasurementConfig,
+    save_path: str = "noise_analysis.png",
+) -> None:
+    """
+    Three-panel noise analysis figure
+    ──────────────────────────────────
+    Top    : Error PSD (raw vs filtered) with tonal peak markers
+    Mid    : Time-domain overlay (raw / filtered / reference)
+    Bottom : Coherence comparison (raw vs filtered)
+    """
+    _apply_style()
+    fs = cfg.fs
+
+    fig = plt.figure(figsize=(14, 10), dpi=140)
+    fig.patch.set_facecolor(_BG)
+
+    fig.suptitle(
+        f"Noise Analysis   ·   SNR = {report.snr_db:.1f} dB   |   "
+        f"Filters: {', '.join(report.recommended_filters) or 'none'}   |   "
+        f"Estimator: {report.recommended_estimator}",
+        color=_TXT, fontsize=10.5, fontweight="bold", y=0.985,
+    )
+
+    gs = gridspec.GridSpec(
+        3, 1, figure=fig,
+        height_ratios=[1.0, 0.8, 0.8],
+        hspace=0.45,
+        left=0.07, right=0.97, top=0.94, bottom=0.06,
+    )
+
+    # ── [0] Error PSD ─────────────────────────────────────────
+    ax_psd = fig.add_subplot(gs[0])
+    _style_ax(ax_psd)
+
+    error_raw = i_meas - i_ref
+    error_filt = i_meas_filtered - i_ref
+    npsd = min(2048, len(error_raw) // 4)
+
+    f_p, P_raw  = signal.welch(error_raw,  fs=fs, nperseg=npsd)
+    _,   P_filt = signal.welch(error_filt, fs=fs, nperseg=npsd)
+    eps = 1e-12
+
+    ax_psd.semilogy(f_p, P_raw,  color=_RED,  lw=1.2, alpha=0.7, label="raw error PSD")
+    ax_psd.semilogy(f_p, P_filt, color=_GREEN, lw=1.5, zorder=3, label="filtered error PSD")
+
+    # Mark tonal peaks
+    for fp in report.tonal_peaks:
+        ax_psd.axvline(fp, color=_YELLOW, lw=0.8, ls=":", alpha=0.7)
+    if report.tonal_peaks:
+        ax_psd.scatter(
+            report.tonal_peaks,
+            [P_raw[np.argmin(np.abs(f_p - fp))] for fp in report.tonal_peaks],
+            color=_YELLOW, s=25, zorder=5, label="tonal peaks",
+        )
+
+    ax_psd.set_xlim([0, fs / 2])
+    ax_psd.set_xlabel("Frequency [Hz]")
+    ax_psd.set_ylabel("PSD [A²/Hz]")
+    ax_psd.set_title("Error Power Spectral Density   (i_meas − i_ref)")
+    ax_psd.legend(loc="upper right", handlelength=1.6)
+
+    # ── [1] Time-domain ────────────────────────────────────────
+    ax_time = fig.add_subplot(gs[1])
+    _style_ax(ax_time)
+
+    # Show only first 500ms for clarity
+    n_show = min(int(0.5 * fs), len(t))
+    t_ms = t[:n_show] * 1e3
+
+    ax_time.plot(t_ms, i_ref[:n_show], color=_BLUE, lw=1.0, alpha=0.6,
+                 label="i_ref")
+    ax_time.plot(t_ms, i_meas[:n_show], color=_RED, lw=0.8, alpha=0.5,
+                 label="i_meas (raw)")
+    ax_time.plot(t_ms, i_meas_filtered[:n_show], color=_GREEN, lw=1.2,
+                 zorder=3, label="i_meas (filtered)")
+
+    ax_time.set_xlabel("Time [ms]")
+    ax_time.set_ylabel("Current [A]")
+    ax_time.set_title("Time Domain   (first 500 ms)")
+    ax_time.legend(loc="upper right", handlelength=1.6, ncol=3)
+
+    # ── [2] Coherence comparison ───────────────────────────────
+    ax_coh = fig.add_subplot(gs[2])
+    _style_ax(ax_coh)
+
+    kw_coh = dict(fs=fs, nperseg=min(cfg.nperseg, len(i_ref) // 4),
+                  window=cfg.window)
+    kw_coh["noverlap"] = kw_coh["nperseg"] // 2
+
+    f_c, Sxx   = signal.welch(i_ref, **kw_coh)
+    _,   Sxy_r = signal.csd(i_ref, i_meas, **kw_coh)
+    _,   Syy_r = signal.welch(i_meas, **kw_coh)
+    _,   Sxy_f = signal.csd(i_ref, i_meas_filtered, **kw_coh)
+    _,   Syy_f = signal.welch(i_meas_filtered, **kw_coh)
+
+    coh_raw  = np.clip(np.abs(Sxy_r)**2 / (Sxx * Syy_r + eps), 0.0, 1.0)
+    coh_filt = np.clip(np.abs(Sxy_f)**2 / (Sxx * Syy_f + eps), 0.0, 1.0)
+
+    fmsk = (f_c >= cfg.f_start) & (f_c <= cfg.f_end)
+    ax_coh.semilogx(f_c[fmsk], coh_raw[fmsk],  color=_RED,   lw=1.0,
+                    alpha=0.6, label="raw")
+    ax_coh.semilogx(f_c[fmsk], coh_filt[fmsk], color=_GREEN, lw=1.5,
+                    zorder=3, label="filtered")
+    ax_coh.axhline(cfg.coh_threshold, color=_YELLOW, lw=1.0, ls="--",
+                   label=f"threshold γ² = {cfg.coh_threshold}")
+
+    # Mean coherence annotations
+    mean_raw  = float(np.mean(coh_raw[fmsk]))
+    mean_filt = float(np.mean(coh_filt[fmsk]))
+    ax_coh.text(
+        0.98, 0.05,
+        f"mean γ²:  raw={mean_raw:.3f}   filtered={mean_filt:.3f}   "
+        f"Δ={mean_filt-mean_raw:+.3f}",
+        transform=ax_coh.transAxes, color=_TXT, fontsize=7.5,
+        ha="right", va="bottom", fontfamily="monospace",
+    )
+
+    ax_coh.set_xlim([cfg.f_start, cfg.f_end])
+    ax_coh.set_ylim([-0.05, 1.08])
+    ax_coh.set_xlabel("Frequency [Hz]")
+    ax_coh.set_ylabel("Coherence γ²")
+    ax_coh.set_title("Coherence Improvement")
+    ax_coh.legend(loc="lower left", handlelength=1.6)
+    ax_coh.xaxis.set_minor_formatter(ticker.NullFormatter())
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+    logger.info(f"Noise analysis plot saved → {save_path}")
+    plt.show()
 
 
 # ════════════════════════════════════════════════════════════
@@ -579,8 +1048,8 @@ def _estimate_step_response(
         np.interp(f_uni[band], f_valid, H_valid.real)
         + 1j * np.interp(f_uni[band], f_valid, H_valid.imag)
     )
-    # DC: copy lowest valid value
-    H_uni[0] = H_uni[band][0] if np.any(band) else 0.0
+    # DC: unity gain (current controller steady-state: i_meas = i_ref)
+    H_uni[0] = 1.0 + 0j
 
     # Smooth edges to reduce Gibbs ringing
     ramp_len = max(1, int(0.05 * np.sum(band)))
@@ -967,6 +1436,7 @@ def plot_results(
     i_ref: np.ndarray,
     i_meas: np.ndarray,
     frf: dict,
+    cfg: MeasurementConfig = None,
     save_path: str = "bandwidth_result.png",
 ) -> None:
     """
@@ -979,7 +1449,8 @@ def plot_results(
     """
     _apply_style()
 
-    cfg  = CFG
+    if cfg is None:
+        cfg = CFG
     f    = frf["f"]
     bw   = float(frf["bandwidth_hz"])
     H    = frf.get("H")
@@ -999,15 +1470,19 @@ def plot_results(
     # Phase (unwrapped already in estimator; guard against re-wrap)
     phase_uw = frf["phase_deg"]
 
-    # Phase margin  (0 dB crossover)
+    # Phase margin  (ref_db crossover — closed-loop reference level)
     phase_margin = None
     f_cross      = None
     cross_mask   = valid & fmsk & (f > cfg.ref_f_high)
     for i in range(len(frf["mag_db"]) - 1):
-        if cross_mask[i] and frf["mag_db"][i] >= 0 >= frf["mag_db"][i+1]:
+        if cross_mask[i] and frf["mag_db"][i] >= ref_db >= frf["mag_db"][i+1]:
             f_cross      = float(f[i])
             phase_margin = 180.0 + float(phase_uw[i])
             break
+
+    # Gain margin  (from FRF estimator, or recompute)
+    gain_margin = frf.get("gain_margin_db")
+    f_gm        = frf.get("f_gain_margin")
 
     # Step response
     fv            = fmsk & valid
@@ -1026,6 +1501,8 @@ def plot_results(
     parts = [f"BW = {bw:.1f} Hz"]
     if phase_margin is not None:
         parts.append(f"PM = {phase_margin:.1f}°")
+    if gain_margin is not None:
+        parts.append(f"GM = {gain_margin:.1f} dB")
     if metrics["t_rise"] is not None:
         parts.append(f"t_rise = {metrics['t_rise']*1e3:.2f} ms")
     if metrics["overshoot_pct"] is not None:
@@ -1071,8 +1548,19 @@ def plot_results(
 
     ax_mag.semilogx(
         f[fmsk], frf["mag_db"][fmsk],
-        color=_BLUE, lw=1.7, zorder=3, label="|H(jω)|",
+        color=_BLUE, lw=1.7, zorder=3, label="|H₁(jω)|",
     )
+
+    # H2 overlay (if available)
+    H2 = frf.get("H2")
+    if H2 is not None:
+        eps = 1e-12
+        mag_db_h2 = 20 * np.log10(np.abs(H2) + eps)
+        ax_mag.semilogx(
+            f[fmsk], mag_db_h2[fmsk],
+            color=_CYAN, lw=1.0, ls=":", alpha=0.6, zorder=2,
+            label="|H₂(jω)|",
+        )
 
     # Horizontal guides
     ax_mag.axhline(ref_db,       color=_DIMTXT, lw=0.7, ls=":",  zorder=1)
@@ -1098,6 +1586,21 @@ def plot_results(
 
     # BW intersection dot
     ax_mag.scatter([bw], [y_ann], color=_YELLOW, s=25, zorder=6)
+
+    # Gain margin annotation
+    if f_gm is not None and gain_margin is not None:
+        mag_at_gm = float(frf["mag_db"][np.argmin(np.abs(f - f_gm))])
+        ax_mag.axvline(f_gm, color=_GREEN, lw=1.0, ls=":", alpha=0.7, zorder=2)
+        ax_mag.scatter([f_gm], [mag_at_gm], color=_GREEN, s=25, zorder=6)
+        ax_mag.annotate(
+            f"GM = {gain_margin:.1f} dB\n@ {f_gm:.1f} Hz",
+            xy=(f_gm, mag_at_gm),
+            xytext=(f_gm * 0.45, mag_at_gm + 5.0),
+            color=_GREEN, fontsize=7.5,
+            arrowprops=dict(arrowstyle="->", color=_GREEN, lw=0.9,
+                            connectionstyle="arc3,rad=0.2"),
+            zorder=5,
+        )
 
     y_lo = max(float(frf["mag_db"][fmsk].min()) - 6.0, -55.0)
     ax_mag.set_xlim([cfg.f_start, cfg.f_end])
@@ -1141,6 +1644,12 @@ def plot_results(
                             connectionstyle="arc3,rad=0.2"),
             zorder=5,
         )
+
+    # Gain margin crossover annotation (phase = -180°)
+    if f_gm is not None:
+        ax_ph.axvline(f_gm, color=_GREEN, lw=1.0, ls=":", alpha=0.7, zorder=2,
+                      label=f"f_{{−180°}} = {f_gm:.1f} Hz")
+        ax_ph.scatter([f_gm], [-180.0], color=_GREEN, s=25, zorder=6)
 
     ax_ph.set_xlim([cfg.f_start, cfg.f_end])
     ax_ph.set_xlabel("Frequency [Hz]")
@@ -1501,10 +2010,249 @@ def plot_comparison(
 
 
 # ════════════════════════════════════════════════════════════
+# Nyquist plot
+# ════════════════════════════════════════════════════════════
+def plot_nyquist(
+    frf: dict,
+    cfg: MeasurementConfig = None,
+    save_path: str = "nyquist_result.png",
+) -> None:
+    """
+    Nyquist diagram of H(jω) with unit circle and stability annotations.
+    """
+    _apply_style()
+    if cfg is None:
+        cfg = CFG
+
+    f     = frf["f"]
+    H     = frf.get("H")
+    if H is None:
+        mag_lin = 10 ** (frf["mag_db"] / 20.0)
+        H = mag_lin * np.exp(1j * np.radians(frf["phase_deg"]))
+
+    valid = frf.get("valid", frf["coherence"] > cfg.coh_threshold)
+    fmsk  = (f >= cfg.f_start) & (f <= cfg.f_end) & valid
+
+    H_plot = H[fmsk]
+    f_plot = f[fmsk]
+
+    fig, ax = plt.subplots(figsize=(9, 9), dpi=140)
+    fig.patch.set_facecolor(_BG)
+    _style_ax(ax)
+
+    # Unit circle
+    theta = np.linspace(0, 2 * np.pi, 256)
+    ax.plot(np.cos(theta), np.sin(theta),
+            color=_DIMTXT, lw=0.8, ls="--", alpha=0.5, label="unit circle")
+
+    # Nyquist curve
+    ax.plot(H_plot.real, H_plot.imag,
+            color=_BLUE, lw=1.8, zorder=3, label="H(jω)")
+    ax.plot(H_plot.real, -H_plot.imag,
+            color=_BLUE, lw=1.0, ls=":", alpha=0.4, zorder=2,
+            label="H(−jω)")
+
+    # Critical point (-1, 0)
+    ax.scatter([-1], [0], color=_RED, s=60, zorder=6, marker="x", linewidths=2)
+    ax.annotate("(−1, 0)", xy=(-1, 0), xytext=(-1.15, 0.15),
+                color=_RED, fontsize=8, fontweight="bold", zorder=5)
+
+    # Frequency markers
+    n_markers = 8
+    marker_idx = np.linspace(0, len(H_plot) - 1, n_markers, dtype=int)
+    for mi in marker_idx:
+        ax.scatter([H_plot[mi].real], [H_plot[mi].imag],
+                   color=_YELLOW, s=18, zorder=5)
+        ax.annotate(
+            f"{f_plot[mi]:.0f}",
+            xy=(H_plot[mi].real, H_plot[mi].imag),
+            xytext=(5, 5), textcoords="offset points",
+            color=_YELLOW, fontsize=6.5, zorder=5,
+        )
+
+    # Start/end markers
+    ax.scatter([H_plot[0].real], [H_plot[0].imag],
+               color=_GREEN, s=40, zorder=6, marker="o",
+               label=f"f_start = {f_plot[0]:.0f} Hz")
+    ax.scatter([H_plot[-1].real], [H_plot[-1].imag],
+               color=_RED, s=40, zorder=6, marker="s",
+               label=f"f_end = {f_plot[-1]:.0f} Hz")
+
+    # Axes
+    ax.axhline(0, color=_SPINE, lw=0.6)
+    ax.axvline(0, color=_SPINE, lw=0.6)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Real")
+    ax.set_ylabel("Imaginary")
+    ax.set_title("Nyquist Diagram  —  H(jω)")
+    ax.legend(loc="lower left", handlelength=1.6, fontsize=7.5)
+
+    bw = float(frf["bandwidth_hz"])
+    gm = frf.get("gain_margin_db")
+    pm_parts = [f"BW = {bw:.1f} Hz"]
+    if gm is not None:
+        pm_parts.append(f"GM = {gm:.1f} dB")
+    ax.text(
+        0.98, 0.98, "   |   ".join(pm_parts),
+        transform=ax.transAxes, color=_TXT, fontsize=8.5,
+        ha="right", va="top", fontweight="bold",
+    )
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=_BG)
+    logger.info(f"Nyquist plot saved → {save_path}")
+    plt.show()
+
+
+# ════════════════════════════════════════════════════════════
+# CSV / JSON export
+# ════════════════════════════════════════════════════════════
+def export_csv(frf: dict, path: str = "bandwidth_result.csv") -> None:
+    """Export FRF data to CSV for MATLAB / Excel interoperability."""
+    f         = frf["f"]
+    mag_db    = frf["mag_db"]
+    phase_deg = frf["phase_deg"]
+    coherence = frf["coherence"]
+
+    with open(path, "w", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["frequency_hz", "magnitude_db", "phase_deg", "coherence"])
+        for i in range(len(f)):
+            writer.writerow([
+                f"{f[i]:.6f}",
+                f"{mag_db[i]:.6f}",
+                f"{phase_deg[i]:.6f}",
+                f"{coherence[i]:.6f}",
+            ])
+    logger.info(f"CSV exported → {path}")
+
+
+def export_json(frf: dict, path: str = "bandwidth_result.json") -> None:
+    """Export FRF summary + data to JSON."""
+    out = {
+        "bandwidth_hz": float(frf["bandwidth_hz"]),
+        "gain_margin_db": frf.get("gain_margin_db"),
+        "f_gain_margin_hz": frf.get("f_gain_margin"),
+        "data": {
+            "frequency_hz": frf["f"].tolist(),
+            "magnitude_db": frf["mag_db"].tolist(),
+            "phase_deg": frf["phase_deg"].tolist(),
+            "coherence": frf["coherence"].tolist(),
+        },
+    }
+    with open(path, "w") as fp:
+        json.dump(out, fp, indent=2, default=float)
+    logger.info(f"JSON exported → {path}")
+
+
+# ════════════════════════════════════════════════════════════
+# Real-time UDP monitor
+# ════════════════════════════════════════════════════════════
+def run_monitor(cfg: MeasurementConfig = None, window_sec: float = 5.0) -> None:
+    """
+    Live scrolling plot of UDP i_ref / i_meas for connection debugging.
+    Press Ctrl+C to stop.
+    """
+    if cfg is None:
+        cfg = CFG
+
+    _apply_style()
+    fig, (ax_sig, ax_err) = plt.subplots(2, 1, figsize=(12, 6), dpi=100,
+                                          gridspec_kw={"height_ratios": [2, 1],
+                                                       "hspace": 0.35})
+    fig.patch.set_facecolor(_BG)
+    _style_ax(ax_sig)
+    _style_ax(ax_err)
+
+    max_pts   = int(window_sec * cfg.fs)
+    t_buf     = deque(maxlen=max_pts)
+    ref_buf   = deque(maxlen=max_pts)
+    meas_buf  = deque(maxlen=max_pts)
+
+    receiver = UDPReceiver(cfg)
+    receiver.start()
+    logger.info(f"Monitor started  ({window_sec}s window)  —  Ctrl+C to stop")
+
+    line_ref,  = ax_sig.plot([], [], color=_BLUE,  lw=1.2, label="i_ref")
+    line_meas, = ax_sig.plot([], [], color=_GREEN, lw=1.0, label="i_meas")
+    line_err,  = ax_err.plot([], [], color=_RED,   lw=1.0, label="error")
+
+    ax_sig.set_ylabel("Current [A]")
+    ax_sig.set_title("Real-Time UDP Monitor")
+    ax_sig.legend(loc="upper right", handlelength=1.2)
+
+    ax_err.set_xlabel("Time [s]")
+    ax_err.set_ylabel("Error [A]")
+    ax_err.legend(loc="upper right", handlelength=1.2)
+
+    pkt_text = ax_sig.text(
+        0.01, 0.97, "", transform=ax_sig.transAxes,
+        color=_DIMTXT, fontsize=7.5, va="top", fontfamily="monospace",
+    )
+
+    def _update(frame):
+        data = receiver.get_data()
+        if not data:
+            return line_ref, line_meas, line_err, pkt_text
+
+        for dp in data:
+            t_buf.append(dp.t)
+            ref_buf.append(dp.i_ref)
+            meas_buf.append(dp.i_meas)
+
+        # Clear receiver buffer to avoid re-processing
+        with receiver._lock:
+            receiver.buffer.clear()
+
+        t_arr   = np.array(t_buf)
+        ref_arr = np.array(ref_buf)
+        meas_arr= np.array(meas_buf)
+
+        line_ref.set_data(t_arr, ref_arr)
+        line_meas.set_data(t_arr, meas_arr)
+        line_err.set_data(t_arr, ref_arr - meas_arr)
+
+        if len(t_arr) > 1:
+            t_lo, t_hi = t_arr[0], t_arr[-1]
+            ax_sig.set_xlim(t_lo, t_hi)
+            ax_err.set_xlim(t_lo, t_hi)
+
+            y_max = max(abs(ref_arr).max(), abs(meas_arr).max(), 0.01) * 1.1
+            ax_sig.set_ylim(-y_max, y_max)
+
+            e_max = max(abs(ref_arr - meas_arr).max(), 0.001) * 1.3
+            ax_err.set_ylim(-e_max, e_max)
+
+        stats = receiver.stats()
+        pkt_text.set_text(
+            f"rx={stats['received']}  drop={stats['dropped']}  "
+            f"buf={len(t_buf)}"
+        )
+
+        return line_ref, line_meas, line_err, pkt_text
+
+    ani = FuncAnimation(fig, _update, interval=50, blit=False, cache_frame_data=False)
+    try:
+        plt.show()
+    finally:
+        receiver.stop()
+
+
+# ════════════════════════════════════════════════════════════
 # Demo mode  (synthetic second-order system)
 # ════════════════════════════════════════════════════════════
-def _simulate_plant(t, i_ref, cfg, rng_seed=42):
-    """Pass signal through synthetic 2nd-order plant + noise."""
+def _simulate_plant(t, i_ref, cfg, rng_seed=42, noisy=False):
+    """Pass signal through synthetic 2nd-order plant + noise.
+
+    Parameters
+    ----------
+    noisy : bool
+        If True, adds realistic BLDC noise:
+        - PWM switching ripple (tonal peaks at 20 kHz harmonics,
+          aliased into measurement band)
+        - Rotor electrical ripple (~6× mechanical speed)
+        - Impulse spikes (simulating EMI / commutation glitches)
+        - Higher broadband noise floor
+    """
     wn   = 2 * np.pi * 180.0
     zeta = 0.65
     num  = [wn**2]
@@ -1512,20 +2260,58 @@ def _simulate_plant(t, i_ref, cfg, rng_seed=42):
     sys  = signal.TransferFunction(num, den)
     _, i_meas, _ = signal.lsim(sys, i_ref, t)
 
-    rng     = np.random.default_rng(rng_seed)
-    i_meas += rng.normal(0, cfg.amplitude * 0.02, size=len(i_meas))
+    rng = np.random.default_rng(rng_seed)
+
+    if noisy:
+        fs = cfg.fs
+        # ── 1. Broadband noise (higher level) ─────────────────
+        i_meas += rng.normal(0, cfg.amplitude * 0.05, size=len(i_meas))
+
+        # ── 2. PWM switching ripple (aliased tonal peaks) ──────
+        #   Real PWM at 20 kHz aliases to 20kHz mod fs; add a few
+        #   strong tonal peaks in the measurement band
+        for f_tone in [47.0, 153.0, 347.0]:
+            amp_tone = cfg.amplitude * 0.15
+            i_meas += amp_tone * np.sin(2 * np.pi * f_tone * t
+                                        + rng.uniform(0, 2*np.pi))
+
+        # ── 3. Rotor electrical ripple ─────────────────────────
+        f_rotor = 23.5  # ~6× mechanical speed for 4-pole-pair motor
+        i_meas += cfg.amplitude * 0.05 * np.sin(2 * np.pi * f_rotor * t)
+
+        # ── 4. Impulse spikes (EMI / commutation) ─────────────
+        n_spikes = max(10, int(len(t) * 0.008))  # ~0.8% of samples
+        spike_idx = rng.choice(len(t), size=n_spikes, replace=False)
+        spike_amp = rng.choice([-1, 1], size=n_spikes) * cfg.amplitude * 2.5
+        i_meas[spike_idx] += spike_amp
+    else:
+        # Clean: minimal broadband noise
+        i_meas += rng.normal(0, cfg.amplitude * 0.02, size=len(i_meas))
+
     return i_meas
 
 
-def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]:
+def _run_demo_single(signal_type: str, cfg: MeasurementConfig,
+                     noisy: bool = False) -> Optional[dict]:
     """Run demo for a single signal type. Returns frf dict or step metrics."""
     est = FRFEstimator(cfg)
+    noise_tag = " (noisy + adaptive)" if noisy else ""
 
     if signal_type == "step":
-        logger.info("── Demo ── Step excitation")
+        logger.info(f"── Demo ── Step excitation{noise_tag}")
         gen = StepGenerator(cfg)
         t, i_ref = gen.get_full_reference()
-        i_meas   = _simulate_plant(t, i_ref, cfg)
+        i_meas   = _simulate_plant(t, i_ref, cfg, noisy=noisy)
+
+        # Adaptive preprocessing for step test
+        if noisy:
+            analyzer = NoiseAnalyzer(cfg)
+            report   = analyzer.analyze(t, i_ref, i_meas)
+            preprocessor = AdaptivePreprocessor(cfg)
+            i_meas_clean = preprocessor.apply(i_meas, report, i_ref=i_ref)
+            plot_noise_analysis(t, i_ref, i_meas, i_meas_clean, report, cfg,
+                                save_path="noise_analysis_step.png")
+            i_meas = i_meas_clean
 
         step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
         m   = step_data["metrics"]
@@ -1566,15 +2352,31 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]
         return step_data["metrics"]
 
     if signal_type == "multisine":
-        logger.info("── Demo ── Multisine excitation")
+        logger.info(f"── Demo ── Multisine excitation{noise_tag}")
         gen = MultisineGenerator(cfg)
     else:
-        logger.info("── Demo ── Chirp excitation")
+        logger.info(f"── Demo ── Chirp excitation{noise_tag}")
         gen = ChirpGenerator(cfg)
 
     t, i_ref = gen.get_full_reference()
-    i_meas   = _simulate_plant(t, i_ref, cfg)
-    frf      = est.estimate(t, i_ref, i_meas)
+    i_meas   = _simulate_plant(t, i_ref, cfg, noisy=noisy)
+
+    # ── Adaptive noise pipeline ────────────────────────────
+    noise_report = None
+    if noisy:
+        analyzer = NoiseAnalyzer(cfg)
+        noise_report = analyzer.analyze(t, i_ref, i_meas)
+
+        preprocessor = AdaptivePreprocessor(cfg)
+        i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
+
+        plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
+                            cfg, save_path=f"noise_analysis_{signal_type}.png")
+
+        # Use filtered data for FRF estimation
+        i_meas = i_meas_filtered
+
+    frf = est.estimate(t, i_ref, i_meas, noise_report=noise_report)
 
     logger.info(f"  BW estimate : {frf['bandwidth_hz']:.1f} Hz  (true: ~180 Hz)")
 
@@ -1589,12 +2391,12 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]
         signal_type=np.array(signal_type),
     )
     logger.info(f"  Raw data saved → {save_npz}")
-    plot_results(t, i_ref, i_meas, frf,
+    plot_results(t, i_ref, i_meas, frf, cfg=cfg,
                  save_path=f"bandwidth_result_{signal_type}.png")
     return frf
 
 
-def _run_demo(signal_type: str = "all") -> None:
+def _run_demo(signal_type: str = "all", noisy: bool = False) -> None:
     """
     Simulate a 2nd-order current controller:
         H(s) = ωn² / (s² + 2ζωn·s + ωn²)
@@ -1607,10 +2409,14 @@ def _run_demo(signal_type: str = "all") -> None:
     if signal_type == "all":
         logger.info("── Demo mode ── sequential: chirp → multisine → step")
         for sig in ("chirp", "multisine", "step"):
-            _run_demo_single(sig, cfg)
+            _run_demo_single(sig, cfg, noisy=noisy)
     else:
         logger.info(f"── Demo mode ── single signal: {signal_type}")
-        _run_demo_single(signal_type, cfg)
+        _run_demo_single(signal_type, cfg, noisy=noisy)
+
+    # Export CSV/JSON alongside npz
+    export_csv(frf, path=f"bandwidth_result_{signal_type}.csv")
+    export_json(frf, path=f"bandwidth_result_{signal_type}.json")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1641,8 +2447,23 @@ class BandwidthMeasurement:
         t, i_ref, i_meas, fs_det = preprocess(data, self.cfg.fs)
         self.cfg.fs = fs_det
 
-        frf = self.estimator.estimate(t, i_ref, i_meas)
-        logger.info(f"  ★  [{phase}] Bandwidth : {frf['bandwidth_hz']:.1f} Hz")
+        # ── Adaptive noise analysis & preprocessing ────────────
+        analyzer = NoiseAnalyzer(self.cfg)
+        noise_report = analyzer.analyze(t, i_ref, i_meas)
+
+        preprocessor = AdaptivePreprocessor(self.cfg)
+        i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
+
+        plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
+                            self.cfg, save_path=f"noise_analysis_{phase}.png")
+
+        i_meas = i_meas_filtered
+
+        frf = self.estimator.estimate(t, i_ref, i_meas,
+                                      noise_report=noise_report)
+        logger.info(f"  ★  [{phase}] Bandwidth : {frf['bandwidth_hz']:.1f} Hz  "
+                    f"(estimator={frf.get('estimator', 'H1')}, "
+                    f"nperseg={frf.get('nperseg_used', self.cfg.nperseg)})")
 
         save_npz = f"bandwidth_raw_{phase}.npz"
         np.savez(
@@ -1656,8 +2477,11 @@ class BandwidthMeasurement:
         )
         logger.info(f"  Raw data saved → {save_npz}")
 
-        plot_results(t, i_ref, i_meas, frf,
+        plot_results(t, i_ref, i_meas, frf, cfg=self.cfg,
                      save_path=f"bandwidth_result_{phase}.png")
+
+        export_csv(frf, path=f"bandwidth_result_{phase}.csv")
+        export_json(frf, path=f"bandwidth_result_{phase}.json")
         return frf
 
     def _analyze_step_phase(self, data: list) -> Optional[dict]:
@@ -1669,6 +2493,18 @@ class BandwidthMeasurement:
         logger.info(f"[step] collected {len(data)} samples")
         t, i_ref, i_meas, fs_det = preprocess(data, self.cfg.fs)
         self.cfg.fs = fs_det
+
+        # ── Adaptive noise analysis & preprocessing ────────────
+        analyzer = NoiseAnalyzer(self.cfg)
+        noise_report = analyzer.analyze(t, i_ref, i_meas)
+
+        preprocessor = AdaptivePreprocessor(self.cfg)
+        i_meas_filtered = preprocessor.apply(i_meas, noise_report, i_ref=i_ref)
+
+        plot_noise_analysis(t, i_ref, i_meas, i_meas_filtered, noise_report,
+                            self.cfg, save_path="noise_analysis_step.png")
+
+        i_meas = i_meas_filtered
 
         step_data = _analyze_step_response(t, i_ref, i_meas, self.cfg)
         m   = step_data["metrics"]
@@ -1793,17 +2629,54 @@ if __name__ == "__main__":
         help="Compare two saved .npz result files. "
              "Example: --compare bandwidth_raw_chirp.npz bandwidth_raw_multisine.npz",
     )
+    parser.add_argument(
+        "--nyquist", metavar="NPZ",
+        help="Generate Nyquist plot from a saved .npz result file.",
+    )
+    parser.add_argument(
+        "--monitor", action="store_true",
+        help="Real-time UDP monitor (scrolling i_ref/i_meas plot). "
+             "Press Ctrl+C to stop.",
+    )
+    parser.add_argument(
+        "--export-csv", metavar="NPZ",
+        help="Export .npz result to CSV. "
+             "Example: --export-csv bandwidth_raw_chirp.npz",
+    )
+    parser.add_argument(
+        "--export-json", metavar="NPZ",
+        help="Export .npz result to JSON. "
+             "Example: --export-json bandwidth_raw_chirp.npz",
+    )
+    parser.add_argument(
+        "--noisy", action="store_true",
+        help="(demo only) Add realistic BLDC noise (PWM ripple, spikes, "
+             "rotor harmonics) and run adaptive preprocessing pipeline.",
+    )
     args = parser.parse_args()
 
     cfg = CFG
 
-    if args.compare:
+    if args.monitor:
+        run_monitor(cfg)
+    elif args.nyquist:
+        frf = _load_frf_from_npz(args.nyquist)
+        plot_nyquist(frf, cfg)
+    elif args.export_csv:
+        frf = _load_frf_from_npz(args.export_csv)
+        out = args.export_csv.replace(".npz", ".csv")
+        export_csv(frf, path=out)
+    elif args.export_json:
+        frf = _load_frf_from_npz(args.export_json)
+        out = args.export_json.replace(".npz", ".json")
+        export_json(frf, path=out)
+    elif args.compare:
         frf_a = _load_frf_from_npz(args.compare[0])
         frf_b = _load_frf_from_npz(args.compare[1])
         logger.info(f"Comparing: {args.compare[0]} vs {args.compare[1]}")
         plot_comparison(frf_a, frf_b, cfg)
     elif args.demo:
-        _run_demo(signal_type=args.signal)
+        _run_demo(signal_type=args.signal, noisy=args.noisy)
     else:
         meas = BandwidthMeasurement(cfg, signal_type=args.signal)
         meas.run()
