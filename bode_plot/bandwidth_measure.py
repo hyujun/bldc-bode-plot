@@ -694,11 +694,18 @@ def _analyze_step_response(
     ss_val = float(np.mean(avg[int(0.8 * len(avg)):]))
     metrics["ss_error_pct"] = abs(1.0 - ss_val) * 100.0
 
+    # ── FRF estimation from step data ──────────────────────
+    # The repeated step signal contains broadband energy; use
+    # Welch cross-spectral estimation to extract H(jω) and BW.
+    est = FRFEstimator(cfg)
+    frf = est.estimate(t, i_ref, i_meas)
+
     return dict(
         t_step=t_step,
         responses=responses,
         avg=avg,
         metrics=metrics,
+        frf=frf,
     )
 
 
@@ -711,10 +718,11 @@ def plot_step_results(
     save_path: str = "step_response_result.png",
 ) -> None:
     """
-    Two-panel step response figure
-    ───────────────────────────────
-    Top    : Raw time-domain data (i_ref + i_meas)
-    Bottom : Ensemble-averaged normalized step response with metrics
+    Four-panel step response figure
+    ────────────────────────────────
+    [0,0] Bode Magnitude     [0,1] Bode Phase
+    [1,:] Raw time-domain data (i_ref + i_meas)
+    [2,:] Ensemble-averaged normalized step response with metrics
     """
     _apply_style()
 
@@ -722,14 +730,17 @@ def plot_step_results(
     avg      = step_data["avg"]
     resps    = step_data["responses"]
     metrics  = step_data["metrics"]
+    frf      = step_data.get("frf")
     t_ms     = t_step * 1e3
 
     # ── Figure ──────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 9), dpi=140)
+    fig = plt.figure(figsize=(14, 16), dpi=140)
     fig.patch.set_facecolor(_BG)
 
     # Suptitle
     parts = []
+    if frf is not None:
+        parts.append(f"BW = {frf['bandwidth_hz']:.1f} Hz")
     if metrics["t_rise"] is not None:
         parts.append(f"t_rise = {metrics['t_rise']*1e3:.2f} ms")
     if metrics["overshoot_pct"] is not None:
@@ -740,23 +751,98 @@ def plot_step_results(
         parts.append(f"SS err = {metrics['ss_error_pct']:.2f} %")
 
     fig.suptitle(
-        "BLDC Current Controller   ·   Step Response (measured)   ·   "
+        "BLDC Current Controller   ·   Step Response + Bode   ·   "
         + "   |   ".join(parts),
         color=_TXT, fontsize=10.5, fontweight="bold",
         y=0.985, x=0.5,
     )
 
     gs = gridspec.GridSpec(
-        2, 1, figure=fig,
-        height_ratios=[0.8, 1.2],
-        hspace=0.38,
-        left=0.07, right=0.97, top=0.94, bottom=0.08,
+        3, 2, figure=fig,
+        height_ratios=[1.0, 0.6, 1.2],
+        hspace=0.45, wspace=0.28,
+        left=0.07, right=0.97, top=0.96, bottom=0.04,
     )
 
     # ════════════════════════════════════════════════════════
-    # [0]  Raw time-domain data
+    # [0,0]  Bode — Magnitude
     # ════════════════════════════════════════════════════════
-    ax_raw = fig.add_subplot(gs[0])
+    ax_mag = fig.add_subplot(gs[0, 0])
+    _style_ax(ax_mag)
+
+    if frf is not None:
+        f     = frf["f"]
+        mag   = frf["mag_db"]
+        coh   = frf["coherence"]
+        valid = frf["valid"]
+        bw    = frf["bandwidth_hz"]
+
+        ax_mag.semilogx(f, mag, color=_DIMTXT, lw=0.7, alpha=0.45,
+                        label="all")
+        ax_mag.semilogx(f[valid], mag[valid], color=_GREEN, lw=1.5,
+                        label=f"γ² > {cfg.coh_threshold:.2f}")
+
+        # -3 dB line
+        rmask  = valid & (f >= cfg.ref_f_low) & (f <= cfg.ref_f_high)
+        ref_db = float(np.mean(mag[rmask])) if np.any(rmask) else 0.0
+        ax_mag.axhline(ref_db - 3.0, color=_YELLOW, lw=1.0, ls="--",
+                       alpha=0.7, label=f"−3 dB ({ref_db-3:.1f} dB)")
+
+        # BW marker
+        ax_mag.axvline(bw, color=_CYAN, lw=1.0, ls=":", alpha=0.8)
+        ax_mag.scatter([bw], [ref_db - 3.0], color=_CYAN, s=50, zorder=5)
+        ax_mag.text(
+            bw, ref_db - 3.0 - 2.0,
+            f"BW = {bw:.1f} Hz", color=_CYAN,
+            fontsize=9, fontweight="bold", ha="center", va="top",
+            zorder=5,
+        )
+
+    ax_mag.set_xlim([cfg.f_start, cfg.f_end])
+    ax_mag.set_xlabel("Frequency [Hz]")
+    ax_mag.set_ylabel("Magnitude [dB]")
+    ax_mag.set_title("Bode  —  Magnitude  (from step)")
+    ax_mag.legend(loc="lower left", handlelength=1.6)
+    ax_mag.xaxis.set_minor_formatter(ticker.NullFormatter())
+
+    # ════════════════════════════════════════════════════════
+    # [0,1]  Bode — Phase
+    # ════════════════════════════════════════════════════════
+    ax_ph = fig.add_subplot(gs[0, 1])
+    _style_ax(ax_ph)
+
+    if frf is not None:
+        phase = frf["phase_deg"]
+
+        ax_ph.semilogx(f, phase, color=_DIMTXT, lw=0.7, alpha=0.45,
+                       label="all")
+        ax_ph.semilogx(f[valid], phase[valid], color=_PURPLE, lw=1.5,
+                       label=f"γ² > {cfg.coh_threshold:.2f}")
+
+        # Phase margin at BW
+        if bw > 0:
+            ph_at_bw = float(np.interp(bw, f[valid], phase[valid]))
+            pm = 180.0 + ph_at_bw
+            ax_ph.axvline(bw, color=_CYAN, lw=1.0, ls=":", alpha=0.8)
+            ax_ph.scatter([bw], [ph_at_bw], color=_CYAN, s=50, zorder=5)
+            ax_ph.text(
+                bw, ph_at_bw - 8,
+                f"PM = {pm:.1f}°", color=_CYAN,
+                fontsize=9, fontweight="bold", ha="center", va="top",
+                zorder=5,
+            )
+
+    ax_ph.set_xlim([cfg.f_start, cfg.f_end])
+    ax_ph.set_xlabel("Frequency [Hz]")
+    ax_ph.set_ylabel("Phase [deg]")
+    ax_ph.set_title("Bode  —  Phase  (from step)")
+    ax_ph.legend(loc="lower left", handlelength=1.6)
+    ax_ph.xaxis.set_minor_formatter(ticker.NullFormatter())
+
+    # ════════════════════════════════════════════════════════
+    # [1,:]  Raw time-domain data
+    # ════════════════════════════════════════════════════════
+    ax_raw = fig.add_subplot(gs[1, :])
     _style_ax(ax_raw)
 
     t_plot = t * 1e3  # ms
@@ -774,9 +860,9 @@ def plot_step_results(
     ax_raw.legend(loc="upper right", handlelength=1.6)
 
     # ════════════════════════════════════════════════════════
-    # [1]  Ensemble-averaged step response
+    # [2,:]  Ensemble-averaged step response
     # ════════════════════════════════════════════════════════
-    ax_step = fig.add_subplot(gs[1])
+    ax_step = fig.add_subplot(gs[2, :])
     _style_ax(ax_step)
 
     # Individual responses (dim)
@@ -1442,7 +1528,11 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]
         i_meas   = _simulate_plant(t, i_ref, cfg)
 
         step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
-        m = step_data["metrics"]
+        m   = step_data["metrics"]
+        frf = step_data.get("frf")
+
+        if frf is not None:
+            logger.info(f"  BW estimate : {frf['bandwidth_hz']:.1f} Hz  (true: ~180 Hz)")
         logger.info(
             f"  Step metrics: t_rise={m['t_rise']*1e3:.2f}ms  "
             f"OS={m['overshoot_pct']:.1f}%  "
@@ -1450,16 +1540,27 @@ def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]
         )
 
         save_npz = "step_response_raw.npz"
-        np.savez(
-            save_npz,
+        save_dict = dict(
             t=t, i_ref=i_ref, i_meas=i_meas,
             t_step=step_data["t_step"],
             avg=step_data["avg"],
             signal_type=np.array("step"),
-            **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
-            **{f"metric_{k}": np.array([v]) for k, v in m.items()
-               if v is not None},
         )
+        save_dict.update(
+            {f"resp_{i}": r for i, r in enumerate(step_data["responses"])}
+        )
+        save_dict.update(
+            {f"metric_{k}": np.array([v]) for k, v in m.items()
+             if v is not None}
+        )
+        if frf is not None:
+            save_dict.update(
+                f=frf["f"], mag_db=frf["mag_db"],
+                phase_deg=frf["phase_deg"],
+                coherence=frf["coherence"],
+                bandwidth_hz=np.array([frf["bandwidth_hz"]]),
+            )
+        np.savez(save_npz, **save_dict)
         logger.info(f"  Raw data saved → {save_npz}")
         plot_step_results(t, i_ref, i_meas, step_data, cfg)
         return step_data["metrics"]
@@ -1570,8 +1671,11 @@ class BandwidthMeasurement:
         self.cfg.fs = fs_det
 
         step_data = _analyze_step_response(t, i_ref, i_meas, self.cfg)
-        m = step_data["metrics"]
+        m   = step_data["metrics"]
+        frf = step_data.get("frf")
 
+        if frf is not None:
+            logger.info(f"  ★  [step] Bandwidth   : {frf['bandwidth_hz']:.1f} Hz")
         if m["t_rise"] is not None:
             logger.info(f"  ★  [step] Rise time   : {m['t_rise']*1e3:.2f} ms")
         if m["overshoot_pct"] is not None:
@@ -1580,16 +1684,27 @@ class BandwidthMeasurement:
             logger.info(f"  ★  [step] Settle time : {m['t_settle']*1e3:.2f} ms")
 
         save_npz = "step_response_raw.npz"
-        np.savez(
-            save_npz,
+        save_dict = dict(
             t=t, i_ref=i_ref, i_meas=i_meas,
             t_step=step_data["t_step"],
             avg=step_data["avg"],
             signal_type=np.array("step"),
-            **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
-            **{f"metric_{k}": np.array([v]) for k, v in m.items()
-               if v is not None},
         )
+        save_dict.update(
+            {f"resp_{i}": r for i, r in enumerate(step_data["responses"])}
+        )
+        save_dict.update(
+            {f"metric_{k}": np.array([v]) for k, v in m.items()
+             if v is not None}
+        )
+        if frf is not None:
+            save_dict.update(
+                f=frf["f"], mag_db=frf["mag_db"],
+                phase_deg=frf["phase_deg"],
+                coherence=frf["coherence"],
+                bandwidth_hz=np.array([frf["bandwidth_hz"]]),
+            )
+        np.savez(save_npz, **save_dict)
         logger.info(f"  Raw data saved → {save_npz}")
 
         plot_step_results(t, i_ref, i_meas, step_data, self.cfg)
