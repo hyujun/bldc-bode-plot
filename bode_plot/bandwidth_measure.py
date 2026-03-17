@@ -444,6 +444,11 @@ def _estimate_step_response(
     f_uni  = np.linspace(0, fs / 2.0, n_pts // 2 + 1)
     H_uni  = np.zeros(len(f_uni), dtype=complex)
 
+    if len(f_valid) == 0:
+        t_step = np.arange(n_pts) * (1.0 / fs)
+        crop   = min(int(0.025 * fs) + 1, n_pts)
+        return t_step[:crop], np.zeros(crop)
+
     f0, f1 = float(f_valid[0]), float(f_valid[-1])
     band   = (f_uni >= f0) & (f_uni <= f1)
 
@@ -796,6 +801,9 @@ def plot_results(
 
     # Step response
     fv            = fmsk & valid
+    if not np.any(fv):
+        logger.warning("No valid coherence data — using all frequency data for step response")
+        fv = fmsk
     t_step, s_step = _estimate_step_response(f[fv], H[fv], cfg.fs)
     t_ms           = t_step * 1e3
     metrics        = _step_metrics(t_step, s_step)
