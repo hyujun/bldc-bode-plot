@@ -129,13 +129,31 @@ def _style_ax(ax: plt.Axes) -> None:
 # ════════════════════════════════════════════════════════════
 # UDP layer
 # ════════════════════════════════════════════════════════════
-# STM32 sends text-based UDP messages:
-#   Start : "Bandwidth Measurement Started"
-#   Data  : "Chirp: t=0.002, ref=0.300, cur=0.159"  (every 2 ms)
-#   End   : "Bandwidth Measurement Done"
+# STM32 sends text-based UDP messages in a sequential protocol:
+#   Start      : "bandwidth measure start"
+#   Chirp data : "chirp: t=0.002, ref=0.300, cur=0.159"
+#   Transition : "chirp done, transition to multisine"
+#   MSine data : "MSine: t=0.002, ref=0.300, cur=0.159"
+#   Transition : "Multisine done, transition to step"
+#   Step data  : "Step: t=0.002, ref=0.300, cur=0.159"
+#   End        : "step done, bandwidth measure completed"
 _DATA_RE = re.compile(
-    r"(?:Chirp|Multisine|Step):\s*t=([\d.]+),\s*ref=([\-\d.]+),\s*cur=([\-\d.]+)"
+    r"(?:chirp|MSine|Step):\s*t=([\d.]+),\s*ref=([\-\d.]+),\s*cur=([\-\d.]+)",
+    re.IGNORECASE,
 )
+_PHASE_RE = re.compile(
+    r"(chirp|MSine|Step):", re.IGNORECASE,
+)
+
+# Protocol message constants
+_MSG_START           = "bandwidth measure start"
+_MSG_CHIRP_DONE      = "chirp done, transition to multisine"
+_MSG_MULTISINE_DONE  = "Multisine done, transition to step"
+_MSG_ALL_DONE        = "step done, bandwidth measure completed"
+
+# Legacy protocol (kept for backward compat)
+_MSG_LEGACY_START = "Bandwidth Measurement Started"
+_MSG_LEGACY_DONE  = "Bandwidth Measurement Done"
 
 @dataclass
 class DataPoint:
@@ -144,12 +162,32 @@ class DataPoint:
     i_meas: float
 
 class UDPReceiver:
+    """Receives sequential chirp → multisine → step data over UDP.
+
+    Data is stored in per-phase buffers accessible via ``get_phase_data()``.
+    The legacy single-signal protocol is also supported for backward compat.
+    """
+
+    PHASES = ("chirp", "multisine", "step")
+
     def __init__(self, cfg: MeasurementConfig):
         self.cfg     = cfg
-        self.buffer  = deque(maxlen=int(cfg.fs * cfg.chirp_duration * 1.5))
+        # Per-phase data buffers
+        max_samples = int(cfg.fs * cfg.chirp_duration * 1.5)
+        self._phase_buffers: dict[str, deque] = {
+            p: deque(maxlen=max_samples) for p in self.PHASES
+        }
+        # Legacy single buffer (for single-signal runs)
+        self.buffer  = deque(maxlen=max_samples)
+
         self._stop   = threading.Event()
         self._started = threading.Event()
         self._done    = threading.Event()
+        # Per-phase done events
+        self._phase_done: dict[str, threading.Event] = {
+            p: threading.Event() for p in self.PHASES
+        }
+        self._current_phase: Optional[str] = None
         self._thread: Optional[threading.Thread] = None
         self._lock   = threading.Lock()
         self._rx     = 0
@@ -171,12 +209,47 @@ class UDPReceiver:
     def wait_for_done(self, timeout: float = 120.0) -> bool:
         return self._done.wait(timeout=timeout)
 
+    def wait_for_phase(self, phase: str, timeout: float = 120.0) -> bool:
+        """Block until a specific phase completes."""
+        ev = self._phase_done.get(phase)
+        if ev is None:
+            return False
+        return ev.wait(timeout=timeout)
+
     def get_data(self) -> list[DataPoint]:
+        """Return all collected data (legacy compat)."""
         with self._lock:
             return list(self.buffer)
 
+    def get_phase_data(self, phase: str) -> list[DataPoint]:
+        """Return collected data for a specific phase."""
+        with self._lock:
+            buf = self._phase_buffers.get(phase, [])
+            return list(buf)
+
     def stats(self) -> dict:
-        return {"received": self._rx, "dropped": self._drop}
+        phase_counts = {}
+        with self._lock:
+            for p in self.PHASES:
+                phase_counts[p] = len(self._phase_buffers[p])
+        return {"received": self._rx, "dropped": self._drop,
+                "per_phase": phase_counts}
+
+    # ── internal helpers ──────────────────────────────────
+    @staticmethod
+    def _classify_phase(msg: str) -> Optional[str]:
+        """Return signal phase from a data line prefix."""
+        m = _PHASE_RE.search(msg)
+        if not m:
+            return None
+        tag = m.group(1).lower()
+        if tag in ("chirp",):
+            return "chirp"
+        if tag in ("msine",):
+            return "multisine"
+        if tag in ("step",):
+            return "step"
+        return None
 
     def _run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -184,40 +257,68 @@ class UDPReceiver:
         sock.bind((self.cfg.udp_host, self.cfg.udp_port))
         sock.settimeout(0.5)
         collecting = False
+
         while not self._stop.is_set():
             try:
                 raw, _ = sock.recvfrom(self.cfg.udp_buffer_size)
                 msg = raw.decode("utf-8", errors="replace").strip()
+                msg_lower = msg.lower()
 
-                if "Bandwidth Measurement Started" in msg:
+                # ── start messages ────────────────────────
+                if _MSG_START.lower() in msg_lower or _MSG_LEGACY_START.lower() in msg_lower:
                     collecting = True
+                    self._current_phase = "chirp"
                     self._started.set()
-                    logger.info("Received: Bandwidth Measurement Started")
+                    logger.info(f"Received: {msg}")
                     continue
 
-                if "Bandwidth Measurement Done" in msg:
+                # ── transition: chirp → multisine ─────────
+                if _MSG_CHIRP_DONE.lower() in msg_lower:
+                    self._phase_done["chirp"].set()
+                    self._current_phase = "multisine"
+                    logger.info(f"Received: {msg}")
+                    continue
+
+                # ── transition: multisine → step ──────────
+                if _MSG_MULTISINE_DONE.lower() in msg_lower:
+                    self._phase_done["multisine"].set()
+                    self._current_phase = "step"
+                    logger.info(f"Received: {msg}")
+                    continue
+
+                # ── end messages ──────────────────────────
+                if (_MSG_ALL_DONE.lower() in msg_lower
+                        or _MSG_LEGACY_DONE.lower() in msg_lower):
+                    self._phase_done["step"].set()
                     collecting = False
+                    self._current_phase = None
                     self._done.set()
-                    logger.info("Received: Bandwidth Measurement Done")
+                    logger.info(f"Received: {msg}")
                     continue
 
                 if not collecting:
                     continue
 
+                # ── data line ─────────────────────────────
                 m = _DATA_RE.search(msg)
                 if not m:
                     self._drop += 1
                     continue
 
-                t     = float(m.group(1))
-                i_ref = float(m.group(2))
+                t_val  = float(m.group(1))
+                i_ref  = float(m.group(2))
                 i_meas = float(m.group(3))
 
                 if abs(i_meas) > self.cfg.max_current * 3:
                     self._drop += 1
                     continue
+
+                phase = self._classify_phase(msg) or self._current_phase
                 with self._lock:
-                    self.buffer.append(DataPoint(t, i_ref, i_meas))
+                    self.buffer.append(DataPoint(t_val, i_ref, i_meas))
+                    if phase and phase in self._phase_buffers:
+                        self._phase_buffers[phase].append(
+                            DataPoint(t_val, i_ref, i_meas))
                 self._rx += 1
             except socket.timeout:
                 continue
@@ -1330,18 +1431,12 @@ def _simulate_plant(t, i_ref, cfg, rng_seed=42):
     return i_meas
 
 
-def _run_demo(signal_type: str = "chirp") -> None:
-    """
-    Simulate a 2nd-order current controller:
-        H(s) = ωn² / (s² + 2ζωn·s + ωn²)
-    with ωn = 2π·180 rad/s, ζ = 0.65
-
-    signal_type: "chirp", "multisine", or "step"
-    """
-    cfg = CFG
+def _run_demo_single(signal_type: str, cfg: MeasurementConfig) -> Optional[dict]:
+    """Run demo for a single signal type. Returns frf dict or step metrics."""
+    est = FRFEstimator(cfg)
 
     if signal_type == "step":
-        logger.info("── Demo mode ── synthetic plant with Step excitation")
+        logger.info("── Demo ── Step excitation")
         gen = StepGenerator(cfg)
         t, i_ref = gen.get_full_reference()
         i_meas   = _simulate_plant(t, i_ref, cfg)
@@ -1349,7 +1444,7 @@ def _run_demo(signal_type: str = "chirp") -> None:
         step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
         m = step_data["metrics"]
         logger.info(
-            f"Demo Step metrics: t_rise={m['t_rise']*1e3:.2f}ms  "
+            f"  Step metrics: t_rise={m['t_rise']*1e3:.2f}ms  "
             f"OS={m['overshoot_pct']:.1f}%  "
             f"t_settle={m['t_settle']*1e3:.2f}ms"
         )
@@ -1365,25 +1460,22 @@ def _run_demo(signal_type: str = "chirp") -> None:
             **{f"metric_{k}": np.array([v]) for k, v in m.items()
                if v is not None},
         )
-        logger.info(f"Raw data saved → {save_npz}")
-
+        logger.info(f"  Raw data saved → {save_npz}")
         plot_step_results(t, i_ref, i_meas, step_data, cfg)
-        return
-
-    est = FRFEstimator(cfg)
+        return step_data["metrics"]
 
     if signal_type == "multisine":
-        logger.info("── Demo mode ── synthetic plant with Multisine excitation")
+        logger.info("── Demo ── Multisine excitation")
         gen = MultisineGenerator(cfg)
     else:
-        logger.info("── Demo mode ── synthetic plant with Chirp excitation")
+        logger.info("── Demo ── Chirp excitation")
         gen = ChirpGenerator(cfg)
 
     t, i_ref = gen.get_full_reference()
     i_meas   = _simulate_plant(t, i_ref, cfg)
     frf      = est.estimate(t, i_ref, i_meas)
 
-    logger.info(f"Demo BW estimate : {frf['bandwidth_hz']:.1f} Hz  (true: ~180 Hz)")
+    logger.info(f"  BW estimate : {frf['bandwidth_hz']:.1f} Hz  (true: ~180 Hz)")
 
     save_npz = f"bandwidth_raw_{signal_type}.npz"
     np.savez(
@@ -1395,95 +1487,63 @@ def _run_demo(signal_type: str = "chirp") -> None:
         bandwidth_hz=np.array([frf["bandwidth_hz"]]),
         signal_type=np.array(signal_type),
     )
-    logger.info(f"Raw data saved → {save_npz}")
-
+    logger.info(f"  Raw data saved → {save_npz}")
     plot_results(t, i_ref, i_meas, frf,
                  save_path=f"bandwidth_result_{signal_type}.png")
+    return frf
+
+
+def _run_demo(signal_type: str = "all") -> None:
+    """
+    Simulate a 2nd-order current controller:
+        H(s) = ωn² / (s² + 2ζωn·s + ωn²)
+    with ωn = 2π·180 rad/s, ζ = 0.65
+
+    signal_type: "all", "chirp", "multisine", or "step"
+    """
+    cfg = CFG
+
+    if signal_type == "all":
+        logger.info("── Demo mode ── sequential: chirp → multisine → step")
+        for sig in ("chirp", "multisine", "step"):
+            _run_demo_single(sig, cfg)
+    else:
+        logger.info(f"── Demo mode ── single signal: {signal_type}")
+        _run_demo_single(signal_type, cfg)
 
 
 # ════════════════════════════════════════════════════════════
 # Live measurement
 # ════════════════════════════════════════════════════════════
 class BandwidthMeasurement:
-    def __init__(self, cfg: MeasurementConfig = CFG, signal_type: str = "chirp"):
+    """Full bandwidth measurement: chirp → multisine → step (sequential).
+
+    The STM32 sends all three signal types in a single session.
+    Each phase is analysed independently and saved to separate files.
+    A single signal type can still be run via ``signal_type`` param.
+    """
+
+    def __init__(self, cfg: MeasurementConfig = CFG, signal_type: str = "all"):
         self.cfg         = cfg
         self.signal_type = signal_type
         self.receiver    = UDPReceiver(cfg)
         self.estimator   = FRFEstimator(cfg)
 
-    def run(self) -> dict:
-        cfg = self.cfg
-        is_step = self.signal_type == "step"
+    # ── helpers ───────────────────────────────────────────
+    def _analyze_frf_phase(self, phase: str, data: list) -> Optional[dict]:
+        """Preprocess + FRF estimation for a chirp/multisine phase."""
+        if not data:
+            logger.warning(f"[{phase}] no data collected — skipping")
+            return None
 
-        if is_step:
-            total_dur = (cfg.step_settle + cfg.step_hold) * cfg.step_repeats
-        else:
-            total_dur = cfg.chirp_duration
-
-        logger.info("=" * 58)
-        logger.info("BLDC Current Controller  Bandwidth Measurement")
-        logger.info(f"  Signal {self.signal_type}  "
-                    f"{'settle+hold' if is_step else f'{cfg.f_start}–{cfg.f_end} Hz'}  "
-                    f"{total_dur:.1f}s  A={cfg.amplitude}A")
-        logger.info(f"  UDP    {cfg.udp_host}:{cfg.udp_port}")
-        logger.info("=" * 58)
-
-        self.receiver.start()
-
-        logger.info("Waiting for 'Bandwidth Measurement Started' from STM32 …")
-        if not self.receiver.wait_for_start(timeout=60.0):
-            self.receiver.stop()
-            raise TimeoutError("Timed out waiting for start message from STM32")
-
-        logger.info(f"Recording … (timeout {total_dur + 30.0:.0f} s)")
-        if not self.receiver.wait_for_done(timeout=total_dur + 30.0):
-            logger.warning("Timed out waiting for done message — using collected data")
-
-        self.receiver.stop()
-        logger.info(f"UDP stats: {self.receiver.stats()}")
-
-        data = self.receiver.get_data()
-        logger.info(f"Collected {len(data)} samples")
-
-        t, i_ref, i_meas, fs_detected = preprocess(data, cfg.fs)
-        cfg.fs = fs_detected
-
-        if is_step:
-            step_data = _analyze_step_response(t, i_ref, i_meas, cfg)
-            m = step_data["metrics"]
-
-            logger.info("=" * 58)
-            if m["t_rise"] is not None:
-                logger.info(f"  ★  Rise time   :  {m['t_rise']*1e3:.2f} ms")
-            if m["overshoot_pct"] is not None:
-                logger.info(f"  ★  Overshoot   :  {m['overshoot_pct']:.1f} %")
-            if m["t_settle"] is not None:
-                logger.info(f"  ★  Settle time :  {m['t_settle']*1e3:.2f} ms")
-            logger.info("=" * 58)
-
-            save_npz = "step_response_raw.npz"
-            np.savez(
-                save_npz,
-                t=t, i_ref=i_ref, i_meas=i_meas,
-                t_step=step_data["t_step"],
-                avg=step_data["avg"],
-                signal_type=np.array("step"),
-                **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
-                **{f"metric_{k}": np.array([v]) for k, v in m.items()
-                   if v is not None},
-            )
-            logger.info(f"Raw data saved → {save_npz}")
-
-            plot_step_results(t, i_ref, i_meas, step_data, cfg)
-            return step_data["metrics"]
+        logger.info(f"[{phase}] collected {len(data)} samples")
+        t, i_ref, i_meas, fs_det = preprocess(data, self.cfg.fs)
+        self.cfg.fs = fs_det
 
         frf = self.estimator.estimate(t, i_ref, i_meas)
+        logger.info(f"  ★  [{phase}] Bandwidth : {frf['bandwidth_hz']:.1f} Hz")
 
-        logger.info("=" * 58)
-        logger.info(f"  ★  Bandwidth  :  {frf['bandwidth_hz']:.1f} Hz")
-        logger.info("=" * 58)
-
-        save_npz = f"bandwidth_raw_{self.signal_type}.npz"
+        save_npz = f"bandwidth_raw_{phase}.npz"
         np.savez(
             save_npz,
             t=t, i_ref=i_ref, i_meas=i_meas,
@@ -1491,13 +1551,109 @@ class BandwidthMeasurement:
             phase_deg=frf["phase_deg"],
             coherence=frf["coherence"],
             bandwidth_hz=np.array([frf["bandwidth_hz"]]),
-            signal_type=np.array(self.signal_type),
+            signal_type=np.array(phase),
         )
-        logger.info(f"Raw data saved → {save_npz}")
+        logger.info(f"  Raw data saved → {save_npz}")
 
         plot_results(t, i_ref, i_meas, frf,
-                     save_path=f"bandwidth_result_{self.signal_type}.png")
+                     save_path=f"bandwidth_result_{phase}.png")
         return frf
+
+    def _analyze_step_phase(self, data: list) -> Optional[dict]:
+        """Preprocess + step response analysis."""
+        if not data:
+            logger.warning("[step] no data collected — skipping")
+            return None
+
+        logger.info(f"[step] collected {len(data)} samples")
+        t, i_ref, i_meas, fs_det = preprocess(data, self.cfg.fs)
+        self.cfg.fs = fs_det
+
+        step_data = _analyze_step_response(t, i_ref, i_meas, self.cfg)
+        m = step_data["metrics"]
+
+        if m["t_rise"] is not None:
+            logger.info(f"  ★  [step] Rise time   : {m['t_rise']*1e3:.2f} ms")
+        if m["overshoot_pct"] is not None:
+            logger.info(f"  ★  [step] Overshoot   : {m['overshoot_pct']:.1f} %")
+        if m["t_settle"] is not None:
+            logger.info(f"  ★  [step] Settle time : {m['t_settle']*1e3:.2f} ms")
+
+        save_npz = "step_response_raw.npz"
+        np.savez(
+            save_npz,
+            t=t, i_ref=i_ref, i_meas=i_meas,
+            t_step=step_data["t_step"],
+            avg=step_data["avg"],
+            signal_type=np.array("step"),
+            **{f"resp_{i}": r for i, r in enumerate(step_data["responses"])},
+            **{f"metric_{k}": np.array([v]) for k, v in m.items()
+               if v is not None},
+        )
+        logger.info(f"  Raw data saved → {save_npz}")
+
+        plot_step_results(t, i_ref, i_meas, step_data, self.cfg)
+        return step_data["metrics"]
+
+    # ── main entry ────────────────────────────────────────
+    def run(self) -> dict:
+        cfg = self.cfg
+
+        # Estimate total duration for all phases
+        chirp_dur = cfg.chirp_duration
+        msine_dur = cfg.chirp_duration
+        step_dur  = (cfg.step_settle + cfg.step_hold) * cfg.step_repeats
+        total_dur = chirp_dur + msine_dur + step_dur
+
+        logger.info("=" * 58)
+        logger.info("BLDC Current Controller  Bandwidth Measurement")
+        if self.signal_type == "all":
+            logger.info(f"  Mode   : sequential (chirp → multisine → step)")
+        else:
+            logger.info(f"  Mode   : single ({self.signal_type})")
+        logger.info(f"  Freq   : {cfg.f_start}–{cfg.f_end} Hz  A={cfg.amplitude}A")
+        logger.info(f"  UDP    : {cfg.udp_host}:{cfg.udp_port}")
+        logger.info("=" * 58)
+
+        self.receiver.start()
+
+        logger.info("Waiting for 'bandwidth measure start' from STM32 …")
+        if not self.receiver.wait_for_start(timeout=60.0):
+            self.receiver.stop()
+            raise TimeoutError("Timed out waiting for start message from STM32")
+
+        logger.info(f"Recording … (timeout {total_dur + 60.0:.0f} s)")
+        if not self.receiver.wait_for_done(timeout=total_dur + 60.0):
+            logger.warning("Timed out waiting for done message — using collected data")
+
+        self.receiver.stop()
+        logger.info(f"UDP stats: {self.receiver.stats()}")
+
+        results: dict = {}
+
+        # ── analyse each phase ────────────────────────────
+        if self.signal_type in ("all", "chirp"):
+            data = self.receiver.get_phase_data("chirp")
+            frf_chirp = self._analyze_frf_phase("chirp", data)
+            if frf_chirp:
+                results["chirp"] = frf_chirp
+
+        if self.signal_type in ("all", "multisine"):
+            data = self.receiver.get_phase_data("multisine")
+            frf_msine = self._analyze_frf_phase("multisine", data)
+            if frf_msine:
+                results["multisine"] = frf_msine
+
+        if self.signal_type in ("all", "step"):
+            data = self.receiver.get_phase_data("step")
+            step_metrics = self._analyze_step_phase(data)
+            if step_metrics:
+                results["step"] = step_metrics
+
+        logger.info("=" * 58)
+        logger.info("Measurement complete — all phases processed")
+        logger.info("=" * 58)
+        return results
 
 
 # ════════════════════════════════════════════════════════════
@@ -1512,10 +1668,10 @@ if __name__ == "__main__":
         help="Run with synthetic 2nd-order plant (no hardware needed)",
     )
     parser.add_argument(
-        "--signal", choices=["chirp", "multisine", "step"],
-        default="chirp",
-        help="Excitation signal type (default: chirp). "
-             "'step' runs time-domain step response test.",
+        "--signal", choices=["all", "chirp", "multisine", "step"],
+        default="all",
+        help="Signal type: 'all' runs sequential chirp→multisine→step "
+             "(default). Single types also supported.",
     )
     parser.add_argument(
         "--compare", nargs=2, metavar="NPZ",
