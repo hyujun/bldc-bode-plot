@@ -832,7 +832,7 @@ def plot_results(
     metrics        = _step_metrics(t_step, s_step)
 
     # ── Figure ──────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 13), dpi=140)
+    fig = plt.figure(figsize=(14, 16), dpi=140)
     fig.patch.set_facecolor(_BG)
 
     # Suptitle
@@ -853,12 +853,12 @@ def plot_results(
     )
 
     gs = gridspec.GridSpec(
-        3, 2,
+        4, 2,
         figure=fig,
-        height_ratios=[1.0, 0.8, 1.0],
-        hspace=0.45, wspace=0.28,
+        height_ratios=[1.0, 0.6, 0.6, 1.0],
+        hspace=0.50, wspace=0.28,
         left=0.07, right=0.97,
-        top=0.96, bottom=0.05,
+        top=0.96, bottom=0.04,
     )
 
     # ════════════════════════════════════════════════════════
@@ -963,26 +963,60 @@ def plot_results(
     ax_ph.xaxis.set_minor_formatter(ticker.NullFormatter())
 
     # ════════════════════════════════════════════════════════
-    # [1, :]  Time-domain  ref vs measured  (full width)
+    # [1, :]  Time-domain  ref vs measured — full overview
     # ════════════════════════════════════════════════════════
     ax_td = fig.add_subplot(gs[1, :])
     _style_ax(ax_td)
 
     t_plot = t * 1e3  # convert to ms
-    ax_td.plot(t_plot, i_ref,  color=_BLUE,  lw=1.2, alpha=0.8,
+
+    ax_td.plot(t_plot, i_ref,  color=_BLUE,  lw=0.8, alpha=0.7,
                label="i_ref (reference)")
-    ax_td.plot(t_plot, i_meas, color=_GREEN, lw=1.0, alpha=0.7,
+    ax_td.plot(t_plot, i_meas, color=_GREEN, lw=0.6, alpha=0.6,
                label="i_meas (measured)")
+
+    # Highlight zoom region
+    t_total = t_plot[-1] - t_plot[0]
+    zoom_center = t_plot[0] + t_total * 0.5
+    zoom_half   = t_total * 0.03   # 6 % of total → visible waveform cycles
+    zoom_lo     = zoom_center - zoom_half
+    zoom_hi     = zoom_center + zoom_half
+    ax_td.axvspan(zoom_lo, zoom_hi, color=_CYAN, alpha=0.12, zorder=1)
+    ax_td.text(zoom_center, ax_td.get_ylim()[0] if ax_td.get_ylim()[0] != 0 else 0,
+               "▼ zoom", color=_CYAN, fontsize=7, ha="center", va="bottom",
+               alpha=0.8)
 
     ax_td.set_xlabel("Time [ms]")
     ax_td.set_ylabel("Current [A]")
-    ax_td.set_title("Time Domain  —  Reference vs Measured")
+    ax_td.set_title("Time Domain  —  Reference vs Measured  (overview)")
     ax_td.legend(loc="upper right", handlelength=1.6)
 
     # ════════════════════════════════════════════════════════
-    # [2, :]  Step response  (full width)
+    # [2, :]  Time-domain  ref vs measured — zoomed-in
     # ════════════════════════════════════════════════════════
-    ax_step = fig.add_subplot(gs[2, :])
+    ax_zoom = fig.add_subplot(gs[2, :])
+    _style_ax(ax_zoom)
+
+    # Select data within zoom range
+    zmask = (t_plot >= zoom_lo) & (t_plot <= zoom_hi)
+    ax_zoom.plot(t_plot[zmask], i_ref[zmask],  color=_BLUE,  lw=1.5, alpha=0.9,
+                 label="i_ref")
+    ax_zoom.plot(t_plot[zmask], i_meas[zmask], color=_GREEN, lw=1.2, alpha=0.8,
+                 label="i_meas")
+
+    ax_zoom.set_xlim([zoom_lo, zoom_hi])
+    ax_zoom.set_xlabel("Time [ms]")
+    ax_zoom.set_ylabel("Current [A]")
+    ax_zoom.set_title(
+        f"Time Domain  —  Zoomed  "
+        f"[{zoom_lo:.1f} – {zoom_hi:.1f} ms]"
+    )
+    ax_zoom.legend(loc="upper right", handlelength=1.6)
+
+    # ════════════════════════════════════════════════════════
+    # [3, :]  Step response  (full width)
+    # ════════════════════════════════════════════════════════
+    ax_step = fig.add_subplot(gs[3, :])
     _style_ax(ax_step)
 
     # Main step curve
