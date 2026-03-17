@@ -16,7 +16,7 @@ Usage
 
 import argparse
 import socket
-import struct
+import re
 import threading
 import time
 import logging
@@ -47,7 +47,7 @@ class MeasurementConfig:
     udp_buffer_size: int = 1024
 
     # Signal
-    fs: float              = 1000.0   # [Hz]  CAN FD rate
+    fs: float              = 500.0    # [Hz]  2 ms interval
     f_start: float         = 5.0      # [Hz]
     f_end: float           = 400.0    # [Hz]
     chirp_duration: float  = 30.0     # [s]
@@ -129,9 +129,13 @@ def _style_ax(ax: plt.Axes) -> None:
 # ════════════════════════════════════════════════════════════
 # UDP layer
 # ════════════════════════════════════════════════════════════
-# Packet: "<dff" → double timestamp_s, float i_ref, float i_meas  (16 B)
-_PKT_FMT  = "<dff"
-_PKT_SIZE = struct.calcsize(_PKT_FMT)
+# STM32 sends text-based UDP messages:
+#   Start : "Bandwidth Measurement Started"
+#   Data  : "Chirp: t=0.002, ref=0.300, cur=0.159"  (every 2 ms)
+#   End   : "Bandwidth Measurement Done"
+_DATA_RE = re.compile(
+    r"(?:Chirp|Multisine|Step):\s*t=([\d.]+),\s*ref=([\-\d.]+),\s*cur=([\-\d.]+)"
+)
 
 @dataclass
 class DataPoint:
@@ -144,6 +148,8 @@ class UDPReceiver:
         self.cfg     = cfg
         self.buffer  = deque(maxlen=int(cfg.fs * cfg.chirp_duration * 1.5))
         self._stop   = threading.Event()
+        self._started = threading.Event()
+        self._done    = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock   = threading.Lock()
         self._rx     = 0
@@ -159,6 +165,12 @@ class UDPReceiver:
         if self._thread:
             self._thread.join(timeout=2.0)
 
+    def wait_for_start(self, timeout: float = 60.0) -> bool:
+        return self._started.wait(timeout=timeout)
+
+    def wait_for_done(self, timeout: float = 120.0) -> bool:
+        return self._done.wait(timeout=timeout)
+
     def get_data(self) -> list[DataPoint]:
         with self._lock:
             return list(self.buffer)
@@ -171,13 +183,36 @@ class UDPReceiver:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         sock.bind((self.cfg.udp_host, self.cfg.udp_port))
         sock.settimeout(0.5)
+        collecting = False
         while not self._stop.is_set():
             try:
                 raw, _ = sock.recvfrom(self.cfg.udp_buffer_size)
-                if len(raw) < _PKT_SIZE:
+                msg = raw.decode("utf-8", errors="replace").strip()
+
+                if "Bandwidth Measurement Started" in msg:
+                    collecting = True
+                    self._started.set()
+                    logger.info("Received: Bandwidth Measurement Started")
+                    continue
+
+                if "Bandwidth Measurement Done" in msg:
+                    collecting = False
+                    self._done.set()
+                    logger.info("Received: Bandwidth Measurement Done")
+                    continue
+
+                if not collecting:
+                    continue
+
+                m = _DATA_RE.search(msg)
+                if not m:
                     self._drop += 1
                     continue
-                t, i_ref, i_meas = struct.unpack(_PKT_FMT, raw[:_PKT_SIZE])
+
+                t     = float(m.group(1))
+                i_ref = float(m.group(2))
+                i_meas = float(m.group(3))
+
                 if abs(i_meas) > self.cfg.max_current * 3:
                     self._drop += 1
                     continue
@@ -1312,11 +1347,15 @@ class BandwidthMeasurement:
         logger.info("=" * 58)
 
         self.receiver.start()
-        logger.info("Waiting 2 s for UDP stream …")
-        time.sleep(2.0)
 
-        logger.info(f"Recording {total_dur + 2.0:.0f} s …")
-        time.sleep(total_dur + 2.0)
+        logger.info("Waiting for 'Bandwidth Measurement Started' from STM32 …")
+        if not self.receiver.wait_for_start(timeout=60.0):
+            self.receiver.stop()
+            raise TimeoutError("Timed out waiting for start message from STM32")
+
+        logger.info(f"Recording … (timeout {total_dur + 30.0:.0f} s)")
+        if not self.receiver.wait_for_done(timeout=total_dur + 30.0):
+            logger.warning("Timed out waiting for done message — using collected data")
 
         self.receiver.stop()
         logger.info(f"UDP stats: {self.receiver.stats()}")
