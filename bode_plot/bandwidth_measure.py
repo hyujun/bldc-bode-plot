@@ -515,7 +515,7 @@ class FRFEstimator:
         t: np.ndarray,
         i_ref: np.ndarray,
         i_meas: np.ndarray,
-        noise_report: Optional[NoiseReport] = None,
+        noise_report: Optional["NoiseReport"] = None,
     ) -> dict:
         fs      = self.cfg.fs
 
